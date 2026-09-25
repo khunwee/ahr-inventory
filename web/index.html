@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AHR Maintenance Inventory</title>
 <link rel="stylesheet" href="/vendor/fonts.css">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/styles.css?v=2.6">
 </head>
 <body>
 
@@ -20,13 +20,12 @@
     <input id="lg-pass" type="password" autocomplete="current-password">
     <button id="lg-btn">เข้าสู่ระบบ</button>
     <div id="lg-err" class="login-err"></div>
-    <div class="login-hint">ครั้งแรก: admin / admin123 — เปลี่ยนรหัสผ่านทันทีหลังเข้าใช้</div>
   </div>
 </div>
 
 <!-- ================= APP ================= -->
 <div id="app" class="app hidden">
-  <aside class="rail">
+  <aside class="rail" id="rail">
     <div class="brand">AHR&nbsp;Inventory<small>MAINTENANCE · AHR</small></div>
     <nav id="nav">
       <a data-view="dashboard"><span class="ic">▣</span> แดชบอร์ด</a>
@@ -36,12 +35,14 @@
       <a data-view="reorder"><span class="ic">⚑</span> ต้องสั่งซื้อ <span id="nav-reorder" class="badge hidden">0</span></a>
       <a data-view="optimize" data-role="leader"><span class="ic">✦</span> วางแผนสั่งซื้อ (Optimize)</a>
       <a data-view="receive" data-role="leader"><span class="ic">▼</span> รับเข้า</a>
+      <a data-view="returns" data-role="leader"><span class="ic">↩</span> คืนอะไหล่</a>
       <a data-view="po" data-role="leader"><span class="ic">▤</span> ใบสั่งซื้อ (PO)</a>
       <a data-view="export" data-role="leader"><span class="ic">⤓</span> ส่งออก Oracle</a>
       <a data-view="audit" data-role="leader"><span class="ic">≡</span> บันทึกการใช้งาน</a>
       <a data-view="users" data-role="admin"><span class="ic">◍</span> ผู้ใช้งาน</a>
       <a data-view="settings" data-role="admin"><span class="ic">⚙</span> ตั้งค่าแจ้งเตือน</a>
       <a data-view="importdata" data-role="admin"><span class="ic">⤒</span> นำเข้าข้อมูล</a>
+      <a data-view="admintools" data-role="admin"><span class="ic">🛠</span> ดูแลระบบ</a>
     </nav>
     <div class="spacer"></div>
     <div class="who">
@@ -56,6 +57,7 @@
 
   <div class="main">
     <div class="topbar">
+      <button id="menu-btn" class="menu-btn" aria-label="เมนู" title="เมนู">☰</button>
       <div class="view-title" id="view-title">แดชบอร์ด</div>
       <div class="grow"></div>
       <button id="lang-btn" class="btn sm" style="margin-right:10px">EN</button>
@@ -65,10 +67,11 @@
   </div>
 </div>
 
+<div class="rail-backdrop" id="rail-backdrop"></div>
 <div class="toasts" id="toasts"></div>
 <div id="modal-root"></div>
 
 <script src="/vendor/chart.umd.min.js"></script>
-<script src="/app.js"></script>
+<script src="/app.js?v=2.6"></script>
 </body>
 </html>
