@@ -9,3 +9,4 @@ openpyxl>=3.1
 qrcode>=7.4
 pulp>=2.8
 psycopg2-binary>=2.9
+tzdata>=2024.1
