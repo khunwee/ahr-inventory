@@ -9,7 +9,7 @@ from .config import settings
 from .models import Base
 
 _is_sqlite = settings.DB_URL.startswith("sqlite")
-connect_args = {"check_same_thread": False} if _is_sqlite else {}
+connect_args = {"check_same_thread": False, "timeout": 30} if _is_sqlite else {}
 engine = create_engine(settings.DB_URL, echo=False, future=True,
                        pool_pre_ping=not _is_sqlite, connect_args=connect_args)
 
@@ -25,18 +25,36 @@ SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False,
 
 
 def _migrate():
-    """Add columns introduced after first release to an existing SQLite DB
-    (create_all only creates missing tables, not missing columns).
-    Only needed for SQLite; on Postgres, create_all already includes them."""
-    if not _is_sqlite:
-        return
+    """Add any columns defined in the models but missing from an existing
+    database (create_all creates missing TABLES, not missing COLUMNS).
+    Works for both SQLite and PostgreSQL, so databases created by older
+    versions (local file or Neon) upgrade in place without losing data."""
     from sqlalchemy import text, inspect
     insp = inspect(engine)
-    if "user" in insp.get_table_names():
-        cols = {c["name"] for c in insp.get_columns("user")}
-        if "must_change_pw" not in cols:
+    existing_tables = set(insp.get_table_names())
+    prep = engine.dialect.identifier_preparer
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        have = {c["name"] for c in insp.get_columns(table.name)}
+        for col in table.columns:
+            if col.name in have or col.primary_key:
+                continue
+            coltype = col.type.compile(dialect=engine.dialect)
+            default = ""
+            if col.default is not None and getattr(col.default, "is_scalar", False):
+                v = col.default.arg
+                if isinstance(v, bool):
+                    v = ("TRUE" if v else "FALSE") if not _is_sqlite else int(v)
+                    default = f" DEFAULT {v}"
+                elif isinstance(v, (int, float)):
+                    default = f" DEFAULT {v}"
+                elif isinstance(v, str):
+                    default = " DEFAULT '" + v.replace("'", "''") + "'"
+            sql = (f"ALTER TABLE {prep.quote(table.name)} "
+                   f"ADD COLUMN {prep.quote(col.name)} {coltype}{default}")
             with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE user ADD COLUMN must_change_pw BOOLEAN DEFAULT 0"))
+                conn.execute(text(sql))
 
 
 def init_db():

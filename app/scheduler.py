@@ -9,6 +9,7 @@ from .db import engine, urgency_of, SessionLocal
 from .models import Requisition, ReqLine, Item
 from .notifications import notify
 from .backup import run_backup
+from .tz import local_today, utc_range, fmt_local
 
 _scheduler = None
 EXPORT_DIR = BASE_DIR / "exports"
@@ -16,7 +17,7 @@ EXPORT_DIR = BASE_DIR / "exports"
 
 def build_eod_report() -> str:
     with SessionLocal() as s:
-        start = datetime.combine(date.today(), datetime.min.time())
+        start = utc_range(local_today(), local_today())[0]
         reqs = s.exec(select(Requisition).where(
             Requisition.created_at >= start,
             Requisition.status.in_(["confirmed", "reconciled"]))).all()
@@ -26,7 +27,7 @@ def build_eod_report() -> str:
         items = s.exec(select(Item)).all()
         flagged = sorted(((it, urgency_of(it)) for it in items if urgency_of(it)),
                          key=lambda x: {"critical": 0, "high": 1, "watch": 2}.get(x[1], 9))
-    lines = [f"📊 สรุปสิ้นวัน {date.today():%d/%m/%Y}",
+    lines = [f"📊 สรุปสิ้นวัน {local_today():%d/%m/%Y}",
              f"การเบิกวันนี้: {len(reqs)} ใบ / {n_lines} รายการ"]
     if flagged:
         lines.append(f"\n⚠️ ต้องสั่งซื้อ ({len(flagged)} รายการ):")
@@ -48,12 +49,12 @@ def export_today_oracle() -> str:
     """Write today's confirmed issues to exports/oracle_<date>.xlsx."""
     from openpyxl import Workbook
     EXPORT_DIR.mkdir(exist_ok=True)
-    today = date.today()
+    today = local_today()
     with SessionLocal() as s:
         reqs = s.exec(select(Requisition).where(
             Requisition.status.in_(["confirmed", "reconciled"]),
-            Requisition.created_at >= datetime.combine(today, datetime.min.time()),
-            Requisition.created_at <= datetime.combine(today, datetime.max.time()))).all()
+            Requisition.created_at >= utc_range(today, today)[0],
+            Requisition.created_at <= utc_range(today, today)[1])).all()
         wb = Workbook(); ws = wb.active; ws.title = "Issues"
         ws.append(["RefNo", "Date", "ItemCode", "Description", "Qty", "UOM",
                    "Machine", "Problem", "Requester", "UnitPrice", "Amount"])
@@ -61,7 +62,7 @@ def export_today_oracle() -> str:
             for l in s.exec(select(ReqLine).where(ReqLine.requisition_id == r.id)).all():
                 it = s.get(Item, l.item_id)
                 price = it.unit_price if it else 0
-                ws.append([r.ref_no, r.created_at.strftime("%Y-%m-%d %H:%M"), l.item_code,
+                ws.append([r.ref_no, fmt_local(r.created_at, "%d/%m/%Y %H:%M"), l.item_code,
                            l.description, l.qty, it.uom if it else "", r.machine_name,
                            r.problem, r.requester_name, price, round(l.qty * price, 2)])
     dest = EXPORT_DIR / f"oracle_{today:%Y%m%d}.xlsx"

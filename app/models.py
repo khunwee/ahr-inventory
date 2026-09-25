@@ -7,7 +7,7 @@ balance, so every figure can be audited back to a transaction.
 """
 from datetime import datetime
 from sqlalchemy import (Column, Integer, String, Float, Boolean, DateTime,
-                        ForeignKey)
+                        ForeignKey, LargeBinary, UniqueConstraint)
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -55,6 +55,7 @@ class Item(Base):
     source_sheet = Column(String, default="")
     last_receipt = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow)
+    image_ver = Column(Integer, default=0)               # 0 = no photo; bumps on each upload
 
 
 class Requisition(Base):
@@ -84,6 +85,7 @@ class ReqLine(Base):
     qty = Column(Float, default=0.0)
     counted_qty = Column(Float, nullable=True)
     system_after = Column(Float, nullable=True)
+    returned_qty = Column(Float, default=0.0)          # total returned to stock
 
 
 class StockTxn(Base):
@@ -140,3 +142,32 @@ class AuditLog(Base):
     action = Column(String, default="")            # login | issue | receive | user | setting | po ...
     detail = Column(String, default="")
     ip = Column(String, default="")
+
+
+class ReturnLog(Base):
+    """A part returned to stock after being withdrawn (e.g. wrong part taken)."""
+    __tablename__ = "return_log"
+    id = Column(Integer, primary_key=True)
+    requisition_id = Column(Integer, ForeignKey("requisition.id"), index=True)
+    reqline_id = Column(Integer, ForeignKey("reqline.id"), index=True)
+    item_id = Column(Integer, ForeignKey("item.id"), index=True)
+    item_code = Column(String, default="")
+    qty = Column(Float, default=0.0)
+    reason = Column(String, default="")
+    returned_by = Column(String, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ImageBlob(Base):
+    """Pictures stored IN the database (part photos, requisition photos) so they
+    survive restarts on hosts with temporary disks (e.g. Render free plan)."""
+    __tablename__ = "image_blob"
+    __table_args__ = (UniqueConstraint("owner_type", "owner_id", "variant", name="uq_image_owner"),)
+    id = Column(Integer, primary_key=True)
+    owner_type = Column(String, index=True)              # item | req
+    owner_id = Column(Integer, index=True)
+    variant = Column(String, default="full")             # full | thumb
+    mime = Column(String, default="image/jpeg")
+    data = Column(LargeBinary)
+    size = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)

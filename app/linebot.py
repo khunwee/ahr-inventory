@@ -196,6 +196,11 @@ def _search(s, q):
     return s.execute(stmt.order_by(Item.item_code).limit(12)).scalars().all()
 
 
+def last_req_id(line_uid):
+    """Requisition most recently created by this LINE user (for photo attach)."""
+    return _sessions.get(line_uid, {}).get("last_req_id")
+
+
 def attach_photo(line_uid, photo_name):
     """Link an uploaded image to the user's most recent requisition."""
     sess = _sessions.get(line_uid, {})

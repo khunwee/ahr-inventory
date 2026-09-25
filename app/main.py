@@ -12,19 +12,21 @@ from fastapi import (FastAPI, Depends, HTTPException, UploadFile, File, Form,
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel
-from sqlalchemy import select, or_, func
+from pydantic import BaseModel, Field
+from sqlalchemy import select, or_, func, update as sa_update
 
 from .config import settings, UPLOAD_DIR, WEB_DIR, DATA_DIR
+from .tz import local_now, local_today, to_local, utc_range, fmt_local
 from .db import init_db, get_session, engine, urgency_of, SessionLocal, Session
 from .models import (User, Machine, Item, Requisition, ReqLine, StockTxn,
-                     Setting, PurchaseOrder, POLine, AuditLog)
+                     Setting, PurchaseOrder, POLine, AuditLog, ReturnLog)
 from .auth import hash_pw, verify_pw, make_token, current_user, require, ROLE_RANK
 from .notifications import ws_manager, notify, test_channel
 from .scheduler import start_scheduler
-from . import settings_store, linebot, labels
+from . import settings_store, linebot, labels, images
 from .audit import log as audit_log
-from .services import issue_requisition, confirm_message, reorder_message
+from .services import (issue_requisition, confirm_message, reorder_message, change_stock, claim,
+                       next_number, save_with_number)
 import secrets
 import httpx as _httpx
 
@@ -56,7 +58,7 @@ def seed_admin():
 # ----------------------------- schemas ------------------------------------
 class LineIn(BaseModel):
     item_id: int
-    qty: float
+    qty: float = Field(gt=0, description="must be > 0")
 
 
 class ReqIn(BaseModel):
@@ -74,7 +76,7 @@ class CountIn(BaseModel):
 
 class ReceiveIn(BaseModel):
     item_id: int
-    qty: float
+    qty: float = Field(gt=0, description="must be > 0")
     ref: str = ""
     note: str = ""
 
@@ -88,9 +90,12 @@ def login(request: Request, form: OAuth2PasswordRequestForm = Depends(),
         raise HTTPException(401, "Wrong username or password")
     ip = request.client.host if request.client else ""
     audit_log("login", f"{u.username} signed in", user=u, ip=ip)
-    return {"access_token": make_token(u), "token_type": "bearer",
-            "user": {"id": u.id, "name": u.full_name or u.username, "role": u.role,
-                     "must_change_pw": bool(u.must_change_pw)}}
+    tok = make_token(u)
+    resp = JSONResponse({"access_token": tok, "token_type": "bearer",
+                         "user": {"id": u.id, "name": u.full_name or u.username, "role": u.role,
+                                  "must_change_pw": bool(u.must_change_pw)}})
+    images.set_session_cookie(resp, request, tok)
+    return resp
 
 
 @app.get("/api/me")
@@ -109,6 +114,7 @@ def item_dict(it: Item):
         "on_hand": it.on_hand, "min_level": it.min_level, "reorder_point": it.reorder_point,
         "max_level": it.max_level, "lead_time_months": it.lead_time_months,
         "unit_price": it.unit_price, "category": it.category, "urgency": urgency_of(it),
+        "image_ver": it.image_ver or 0,
     }
 
 
@@ -180,18 +186,22 @@ def update_item(item_id: int, payload: ItemPatch, s: Session = Depends(get_sessi
         if s.exec(select(Item).where(Item.item_code == code)).first():
             raise HTTPException(400, "รหัสอะไหล่นี้มีอยู่แล้ว")
         it.item_code = code
-    old_oh = it.on_hand or 0
     for k, v in data.items():
         if k in ("on_hand", "item_code"):
             continue
         setattr(it, k, v)
-    if "on_hand" in data and data["on_hand"] is not None and data["on_hand"] != old_oh:
-        it.on_hand = data["on_hand"]
-        s.add(StockTxn(item_id=it.id, item_code=it.item_code, txn_type="adjust",
-                       qty=round(data["on_hand"] - old_oh, 3), balance_after=it.on_hand,
-                       ref="EDIT", note="แก้ไขจำนวนโดยแอดมิน", user_id=u.id))
+    if "on_hand" in data and data["on_hand"] is not None:
+        # admin typed an absolute counted value: lock the row, read the CURRENT
+        # balance, and apply only the difference atomically (logged as adjust)
+        cur = s.execute(select(Item.on_hand).where(Item.id == it.id).with_for_update()).scalar_one() or 0
+        diff = round(float(data["on_hand"]) - cur, 6)
+        if diff:
+            bal = change_stock(s, it.id, diff)
+            s.add(StockTxn(item_id=it.id, item_code=it.item_code, txn_type="adjust",
+                           qty=diff, balance_after=bal, ref="EDIT",
+                           note="แก้ไขจำนวนโดยแอดมิน", user_id=u.id))
     it.updated_at = datetime.utcnow()
-    s.add(it); s.commit()
+    s.add(it); s.commit(); s.refresh(it)
     audit_log("item", f"edited {it.item_code}: {', '.join(data.keys())}", user=u)
     return {"ok": True, "item": item_dict(it)}
 
@@ -204,10 +214,7 @@ def machines(s: Session = Depends(get_session), u: User = Depends(current_user))
 
 # --------------------------- requisitions ---------------------------------
 def _next_ref(s: Session) -> str:
-    today = datetime.now().strftime("%Y%m%d")
-    n = s.exec(select(func.count(Requisition.id))
-               .where(Requisition.ref_no.like(f"REQ{today}%"))).one()
-    return f"REQ{today}-{n + 1:03d}"
+    return next_number(s, Requisition.ref_no, f"REQ{local_now():%Y%m%d}-")
 
 
 @app.post("/api/requisitions")
@@ -219,11 +226,12 @@ async def create_req(payload: ReqIn, s: Session = Depends(get_session),
     if payload.machine_id:
         m = s.get(Machine, payload.machine_id)
         mname = m.name if m else mname
-    req = Requisition(ref_no=_next_ref(s), requester_id=u.id,
+    req = Requisition(requester_id=u.id,
                       requester_name=u.full_name or u.username,
                       machine_id=payload.machine_id, machine_name=mname,
                       problem=payload.problem, note=payload.note, status="draft", source="web")
-    s.add(req); s.commit(); s.refresh(req)
+    req = save_with_number(s, req, "ref_no", _next_ref)
+    s.commit(); s.refresh(req)
     for ln in payload.lines:
         it = s.get(Item, ln.item_id)
         if not it:
@@ -234,20 +242,6 @@ async def create_req(payload: ReqIn, s: Session = Depends(get_session),
     return {"id": req.id, "ref_no": req.ref_no, "status": req.status}
 
 
-@app.post("/api/requisitions/{req_id}/photo")
-async def upload_photo(req_id: int, file: UploadFile = File(...),
-                       s: Session = Depends(get_session), u: User = Depends(current_user)):
-    req = s.get(Requisition, req_id)
-    if not req:
-        raise HTTPException(404, "Requisition not found")
-    ext = (file.filename or "img").split(".")[-1][:5]
-    path = UPLOAD_DIR / f"{req.ref_no}.{ext}"
-    path.write_bytes(await file.read())
-    req.photo_path = path.name
-    s.add(req); s.commit()
-    return {"photo": path.name}
-
-
 @app.post("/api/requisitions/{req_id}/confirm")
 async def confirm_req(req_id: int, s: Session = Depends(get_session),
                       u: User = Depends(current_user)):
@@ -256,27 +250,27 @@ async def confirm_req(req_id: int, s: Session = Depends(get_session),
     req = s.get(Requisition, req_id)
     if not req:
         raise HTTPException(404, "Requisition not found")
-    if req.status != "draft":
-        raise HTTPException(400, f"Requisition already {req.status}")
+    if req.status != "draft" or not claim(s, Requisition, req_id, "draft", "confirmed"):
+        raise HTTPException(400, f"ใบเบิกนี้ถูกยืนยันไปแล้ว ({req.ref_no})")
     lines = s.exec(select(ReqLine).where(ReqLine.requisition_id == req_id)).all()
     triggered = []
     changed = []
     for ln in lines:
         it = s.get(Item, ln.item_id)
-        if not it:
+        if not it or not ln.qty or ln.qty <= 0:
             continue
-        it.on_hand = (it.on_hand or 0) - ln.qty          # auto stock deduction
-        it.updated_at = datetime.utcnow()
-        ln.system_after = it.on_hand
+        bal = change_stock(s, it.id, -ln.qty)              # atomic stock deduction
+        ln.system_after = bal
         s.add(StockTxn(item_id=it.id, item_code=it.item_code, txn_type="issue",
-                       qty=ln.qty, balance_after=it.on_hand, ref=req.ref_no,
+                       qty=ln.qty, balance_after=bal, ref=req.ref_no,
                        user_id=u.id, machine_name=req.machine_name,
                        note=req.problem))
-        s.add(it); s.add(ln)
+        s.add(ln)
+        s.refresh(it)
         changed.append(item_dict(it))
         if urgency_of(it):
             triggered.append((it, urgency_of(it)))
-    req.status = "confirmed"
+    s.refresh(req)
     req.confirmed_at = datetime.utcnow()
     s.add(req); s.commit()
     audit_log("issue", f"{req.ref_no}: {len(lines)} line(s), machine={req.machine_name}", user=u)
@@ -325,19 +319,28 @@ def list_reqs(date_from: Optional[date] = None, date_to: Optional[date] = None,
     if requester_id:
         stmt = stmt.where(Requisition.requester_id == requester_id)
     if date_from:
-        stmt = stmt.where(Requisition.created_at >= datetime.combine(date_from, datetime.min.time()))
+        stmt = stmt.where(Requisition.created_at >= utc_range(date_from, date_from)[0])
     if date_to:
-        stmt = stmt.where(Requisition.created_at <= datetime.combine(date_to, datetime.max.time()))
+        stmt = stmt.where(Requisition.created_at <= utc_range(date_to, date_to)[1])
     reqs = s.exec(stmt.order_by(Requisition.created_at.desc()).limit(300)).all()
     out = []
     for r in reqs:
         lines = s.exec(select(ReqLine).where(ReqLine.requisition_id == r.id)).all()
+        rets = s.exec(select(ReturnLog).where(ReturnLog.requisition_id == r.id)
+                      .order_by(ReturnLog.created_at)).all()
         out.append({
             "id": r.id, "ref_no": r.ref_no, "requester": r.requester_name,
             "machine": r.machine_name, "problem": r.problem, "status": r.status,
             "source": r.source, "created_at": r.created_at, "photo": r.photo_path,
-            "lines": [{"line_id": l.id, "item_code": l.item_code, "description": l.description,
-                       "qty": l.qty, "counted_qty": l.counted_qty, "system_after": l.system_after,
+            "has_return": bool(rets),
+            "remark": "; ".join(f"คืน {x.item_code} x{x.qty:g} — {x.reason}" for x in rets),
+            "returns": [{"item_code": x.item_code, "qty": x.qty, "reason": x.reason,
+                         "by": x.returned_by, "at": x.created_at} for x in rets],
+            "lines": [{"line_id": l.id, "item_id": l.item_id, "item_code": l.item_code,
+                       "image_ver": (getattr(s.get(Item, l.item_id), "image_ver", 0) or 0),
+                       "description": l.description, "qty": l.qty,
+                       "returned_qty": l.returned_qty or 0,
+                       "counted_qty": l.counted_qty, "system_after": l.system_after,
                        "variance": (None if l.counted_qty is None or l.system_after is None
                                     else round(l.counted_qty - l.system_after, 3))}
                       for l in lines]})
@@ -367,13 +370,12 @@ async def receive(payload: ReceiveIn, s: Session = Depends(get_session),
     it = s.get(Item, payload.item_id)
     if not it:
         raise HTTPException(404, "Item not found")
-    it.on_hand = (it.on_hand or 0) + payload.qty
+    bal = change_stock(s, it.id, payload.qty)            # atomic
     it.last_receipt = datetime.utcnow()
-    it.updated_at = datetime.utcnow()
     s.add(StockTxn(item_id=it.id, item_code=it.item_code, txn_type="receive",
-                   qty=payload.qty, balance_after=it.on_hand, ref=payload.ref,
+                   qty=payload.qty, balance_after=bal, ref=payload.ref,
                    user_id=u.id, note=payload.note))
-    s.add(it); s.commit()
+    s.add(it); s.commit(); s.refresh(it)
     audit_log("receive", f"{it.item_code} +{payload.qty:g} -> {it.on_hand:g}", user=u)
     await notify("stock.received",
                  f"📥 รับเข้า {it.item_code} x{payload.qty:g} คงเหลือ {it.on_hand:g}",
@@ -410,7 +412,7 @@ def dashboard(s: Session = Depends(get_session), u: User = Depends(current_user)
     txns = s.exec(select(StockTxn).where(StockTxn.created_at >= since)).all()
     by_day = {}
     for t in txns:
-        d = t.created_at.strftime("%m-%d")
+        d = to_local(t.created_at).strftime("%m-%d")
         by_day.setdefault(d, {"issue": 0, "receive": 0})
         if t.txn_type in ("issue", "receive"):
             by_day[d][t.txn_type] += t.qty
@@ -449,7 +451,7 @@ def dashboard(s: Session = Depends(get_session), u: User = Depends(current_user)
     # withdrawal value by month (last 6 months)
     monthly = {}
     for t in all_issue:
-        key = t.created_at.strftime("%Y-%m")
+        key = to_local(t.created_at).strftime("%Y-%m")
         monthly[key] = monthly.get(key, 0) + t.qty * price_map.get(t.item_id, 0)
     mkeys = sorted(monthly.keys())[-6:]
 
@@ -476,37 +478,61 @@ def dashboard(s: Session = Depends(get_session), u: User = Depends(current_user)
 
 
 # --------------------------- oracle export --------------------------------
+def _issue_lines(s, date_from, date_to, requester_id=None):
+    """Every confirmed withdrawal line in the Thai-time date range, with returns
+    netted out: yields (requisition, line, item, unit_price, returned, net_qty)."""
+    lo, hi = utc_range(date_from, date_to)
+    stmt = select(Requisition).where(
+        Requisition.status.in_(["confirmed", "reconciled"]),
+        Requisition.created_at >= lo, Requisition.created_at <= hi)
+    if requester_id:
+        stmt = stmt.where(Requisition.requester_id == requester_id)
+    for r in s.exec(stmt.order_by(Requisition.created_at)).all():
+        for l in s.exec(select(ReqLine).where(ReqLine.requisition_id == r.id)).all():
+            it = s.get(Item, l.item_id)
+            price = (it.unit_price if it else 0) or 0
+            ret = l.returned_qty or 0
+            yield r, l, it, price, ret, round(l.qty - ret, 3)
+
+
+ORACLE_HEADER = ["RefNo", "Date", "ItemCode", "Description", "Qty", "Returned", "NetQty",
+                 "UOM", "Machine", "Problem", "Requester", "UnitPrice", "Amount", "Remark"]
+
+
+def _return_remarks(s, reqline_id):
+    logs = s.exec(select(ReturnLog).where(ReturnLog.reqline_id == reqline_id)).all()
+    return "; ".join(f"คืน {x.qty:g}: {x.reason}" for x in logs)
+
+
+def _oracle_rows(s, date_from, date_to, requester_id=None):
+    rows = []
+    for r, l, it, price, ret, net in _issue_lines(s, date_from, date_to, requester_id):
+        rows.append([r.ref_no, fmt_local(r.created_at, "%d/%m/%Y %H:%M"), l.item_code,
+                     l.description, l.qty, ret, net, it.uom if it else "", r.machine_name,
+                     r.problem, r.requester_name, price, round(net * price, 2),
+                     _return_remarks(s, l.id) if ret else ""])
+    return rows
+
+
 @app.get("/api/export/oracle")
 def export_oracle(date_from: date, date_to: date, requester_id: Optional[int] = None,
                   s: Session = Depends(get_session), u: User = Depends(require("leader"))):
-    """CSV of confirmed issues in range, columns ready to key into Oracle."""
-    _stmt = select(Requisition).where(
-        Requisition.status.in_(["confirmed", "reconciled"]),
-        Requisition.created_at >= datetime.combine(date_from, datetime.min.time()),
-        Requisition.created_at <= datetime.combine(date_to, datetime.max.time()),
-    )
-    if requester_id:
-        _stmt = _stmt.where(Requisition.requester_id == requester_id)
-    reqs = s.exec(_stmt).all()
+    """CSV of confirmed issues (net of returns), ready to key into Oracle."""
     buf = io.StringIO()
+    buf.write("\ufeff")                       # BOM so Excel shows Thai correctly
     w = csv.writer(buf)
-    w.writerow(["RefNo", "Date", "ItemCode", "Description", "Qty", "UOM",
-                "Machine", "Problem", "Requester", "UnitPrice", "Amount"])
-    for r in reqs:
-        for l in s.exec(select(ReqLine).where(ReqLine.requisition_id == r.id)).all():
-            it = s.get(Item, l.item_id)
-            price = it.unit_price if it else 0
-            w.writerow([r.ref_no, r.created_at.strftime("%Y-%m-%d %H:%M"), l.item_code,
-                        l.description, l.qty, it.uom if it else "", r.machine_name,
-                        r.problem, r.requester_name, price, round(l.qty * price, 2)])
-    buf.seek(0)
+    w.writerow(ORACLE_HEADER)
+    for row in _oracle_rows(s, date_from, date_to, requester_id):
+        w.writerow(row)
     fname = f"oracle_export_{date_from}_{date_to}.csv"
-    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv; charset=utf-8",
                              headers={"Content-Disposition": f"attachment; filename={fname}"})
 
 
 @app.get("/api/uploads/{name}")
-def get_upload(name: str):
+def get_upload(name: str, u: User = Depends(images.viewer)):
+    if "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(400, "bad name")
     p = UPLOAD_DIR / name
     if not p.exists():
         raise HTTPException(404, "Not found")
@@ -581,9 +607,11 @@ async def line_webhook(request: Request):
         elif msg.get("type") == "image":
             try:
                 content = await _line_get_image(msg.get("id", ""))
-                name = f"line_{msg.get('id','img')}.jpg"
-                (UPLOAD_DIR / name).write_bytes(content)
-                ok = linebot.attach_photo(line_uid, name)
+                rid = linebot.last_req_id(line_uid)
+                ok = False
+                if rid and content:
+                    with SessionLocal() as s2:
+                        images.save_req_photo_bytes(s2, rid, content); s2.commit(); ok = True
                 await _line_reply(reply_token, [{"type": "text",
                     "text": "📎 แนบรูปกับใบเบิกล่าสุดแล้ว" if ok else "ยังไม่มีใบเบิกให้แนบรูป"}])
             except Exception:
@@ -726,10 +754,7 @@ class POIn(BaseModel):
 
 
 def _next_po(s) -> str:
-    ym = datetime.now().strftime("%Y%m")
-    n = s.exec(select(func.count(PurchaseOrder.id))
-               .where(PurchaseOrder.po_no.like(f"PO{ym}%"))).one()
-    return f"PO{ym}-{n + 1:03d}"
+    return next_number(s, PurchaseOrder.po_no, f"PO{local_now():%Y%m}-")
 
 
 @app.post("/api/po")
@@ -737,9 +762,9 @@ def create_po(payload: POIn, s: Session = Depends(get_session),
               u: User = Depends(require("leader"))):
     if not payload.lines:
         raise HTTPException(400, "No items to order")
-    po = PurchaseOrder(po_no=_next_po(s), created_by=u.full_name or u.username,
+    po = PurchaseOrder(created_by=u.full_name or u.username,
                        note=payload.note, status="ordered")
-    s.add(po); s.flush()
+    po = save_with_number(s, po, "po_no", _next_po)
     for ln in payload.lines:
         it = s.get(Item, ln.item_id)
         if not it:
@@ -773,22 +798,22 @@ async def receive_po(po_id: int, s: Session = Depends(get_session),
     po = s.get(PurchaseOrder, po_id)
     if not po:
         raise HTTPException(404, "PO not found")
-    if po.status == "received":
-        raise HTTPException(400, "PO already received")
+    if po.status != "ordered" or not claim(s, PurchaseOrder, po_id, "ordered", "received"):
+        raise HTTPException(400, "ใบสั่งซื้อนี้รับของไปแล้ว หรือถูกยกเลิกแล้ว — รับซ้ำไม่ได้"
+                                 if po.status != "cancelled" else "ใบสั่งซื้อถูกยกเลิกแล้ว — รับของไม่ได้")
     lines = s.exec(select(POLine).where(POLine.po_id == po_id)).all()
     for l in lines:
         it = s.get(Item, l.item_id)
-        if not it:
+        if not it or not l.qty or l.qty <= 0:
             continue
-        it.on_hand = (it.on_hand or 0) + l.qty
+        bal = change_stock(s, it.id, l.qty)               # atomic
         it.last_receipt = datetime.utcnow()
-        it.updated_at = datetime.utcnow()
         l.received_qty = l.qty
         s.add(StockTxn(item_id=it.id, item_code=it.item_code, txn_type="receive",
-                       qty=l.qty, balance_after=it.on_hand, ref=po.po_no,
+                       qty=l.qty, balance_after=bal, ref=po.po_no,
                        user_id=u.id, note="PO receive"))
         s.add(it); s.add(l)
-    po.status = "received"
+    s.refresh(po)
     po.received_at = datetime.utcnow()
     s.add(po); s.commit()
     audit_log("po", f"received {po.po_no}", user=u)
@@ -820,7 +845,7 @@ def po_xlsx(po_id: int, s: Session = Depends(get_session),
     from openpyxl import Workbook
     wb = Workbook(); ws = wb.active; ws.title = "PO"
     ws.append([f"ใบสั่งซื้อ {po.po_no}"])
-    ws.append(["วันที่", po.created_at.strftime("%Y-%m-%d %H:%M"), "โดย", po.created_by])
+    ws.append(["วันที่", fmt_local(po.created_at, "%d/%m/%Y %H:%M"), "โดย", po.created_by])
     ws.append([])
     ws.append(["No.", "Item Code", "Description", "Qty", "Unit Price", "Amount"])
     for i, l in enumerate(lines, 1):
@@ -834,34 +859,13 @@ def po_xlsx(po_id: int, s: Session = Depends(get_session),
 
 
 # --------------------------- oracle export (xlsx) -------------------------
-def _oracle_rows(s, date_from, date_to):
-    reqs = s.exec(select(Requisition).where(
-        Requisition.status.in_(["confirmed", "reconciled"]),
-        Requisition.created_at >= datetime.combine(date_from, datetime.min.time()),
-        Requisition.created_at <= datetime.combine(date_to, datetime.max.time()),
-    )).all()
-    rows = []
-    for r in reqs:
-        for l in s.exec(select(ReqLine).where(ReqLine.requisition_id == r.id)).all():
-            it = s.get(Item, l.item_id)
-            price = it.unit_price if it else 0
-            rows.append([r.ref_no, r.created_at.strftime("%Y-%m-%d %H:%M"), l.item_code,
-                         l.description, l.qty, it.uom if it else "", r.machine_name,
-                         r.problem, r.requester_name, price, round(l.qty * price, 2)])
-    return rows
-
-
-ORACLE_HEADER = ["RefNo", "Date", "ItemCode", "Description", "Qty", "UOM",
-                 "Machine", "Problem", "Requester", "UnitPrice", "Amount"]
-
-
 @app.get("/api/export/oracle.xlsx")
-def export_oracle_xlsx(date_from: date, date_to: date,
+def export_oracle_xlsx(date_from: date, date_to: date, requester_id: Optional[int] = None,
                        s: Session = Depends(get_session), u: User = Depends(require("leader"))):
     from openpyxl import Workbook
     wb = Workbook(); ws = wb.active; ws.title = "Issues"
     ws.append(ORACLE_HEADER)
-    for row in _oracle_rows(s, date_from, date_to):
+    for row in _oracle_rows(s, date_from, date_to, requester_id):
         ws.append(row)
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     fname = f"oracle_export_{date_from}_{date_to}.xlsx"
@@ -980,36 +984,25 @@ def export_stock(q: str = "", low_only: bool = False,
 @app.get("/api/requisitions/summary")
 def requisitions_summary(date_from: date, date_to: date, requester_id: Optional[int] = None,
                          s: Session = Depends(get_session), u: User = Depends(require("leader"))):
-    """Aggregated withdrawal summary for a period — reference for cutting stock in Oracle."""
-    stmt = select(Requisition).where(
-        Requisition.status.in_(["confirmed", "reconciled"]),
-        Requisition.created_at >= datetime.combine(date_from, datetime.min.time()),
-        Requisition.created_at <= datetime.combine(date_to, datetime.max.time()),
-    )
-    if requester_id:
-        stmt = stmt.where(Requisition.requester_id == requester_id)
-    reqs = s.exec(stmt).all()
-    agg = {}
-    n_req = len(reqs)
-    total_value = 0.0
-    for r in reqs:
-        for l in s.exec(select(ReqLine).where(ReqLine.requisition_id == r.id)).all():
-            it = s.get(Item, l.item_id)
-            price = it.unit_price if it else 0
-            a = agg.setdefault(l.item_code, {"item_code": l.item_code, "description": l.description,
-                                             "uom": it.uom if it else "", "qty": 0.0,
-                                             "unit_price": price, "machines": set()})
-            a["qty"] += l.qty
-            if r.machine_name:
-                a["machines"].add(r.machine_name)
-            total_value += l.qty * price
+    """Aggregated withdrawal summary (net of returns) — reference for Oracle."""
+    agg, reqs, total_value = {}, set(), 0.0
+    for r, l, it, price, ret, net in _issue_lines(s, date_from, date_to, requester_id):
+        reqs.add(r.id)
+        a = agg.setdefault(l.item_code, {"item_code": l.item_code, "description": l.description,
+                                         "uom": it.uom if it else "", "qty": 0.0, "returned": 0.0,
+                                         "unit_price": price, "machines": set()})
+        a["qty"] += l.qty; a["returned"] += ret
+        if r.machine_name:
+            a["machines"].add(r.machine_name)
+        total_value += net * price
     rows = [{"item_code": v["item_code"], "description": v["description"], "uom": v["uom"],
-             "qty": round(v["qty"], 2), "unit_price": v["unit_price"],
-             "amount": round(v["qty"] * v["unit_price"], 2),
+             "qty": round(v["qty"] - v["returned"], 2), "gross": round(v["qty"], 2),
+             "returned": round(v["returned"], 2), "unit_price": v["unit_price"],
+             "amount": round((v["qty"] - v["returned"]) * v["unit_price"], 2),
              "machines": ", ".join(sorted(v["machines"]))[:60]}
             for v in agg.values()]
     rows.sort(key=lambda x: -x["amount"])
-    return {"date_from": str(date_from), "date_to": str(date_to), "requisitions": n_req,
+    return {"date_from": str(date_from), "date_to": str(date_to), "requisitions": len(reqs),
             "items": len(rows), "total_value": round(total_value, 2), "rows": rows}
 
 
@@ -1070,31 +1063,41 @@ async def import_upload(file: UploadFile = File(...), replace: bool = False,
             return d
 
     n_items = n_mach = 0
+    merged = []
     if "Items" in wb.sheetnames:
         ws = wb["Items"]
         header = [str(c.value).strip() if c.value else "" for c in ws[1]]
         idx = {name: header.index(name) for name in IMPORT_COLS if name in header}
         if "item_code" not in idx:
             raise HTTPException(400, "ไม่พบคอลัมน์ item_code ในชีต Items")
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        # 1) read + group rows by part code (duplicates are COMBINED: stock summed)
+        groups = {}
+        for rn, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
             if not row or idx["item_code"] >= len(row):
                 continue
             code = row[idx["item_code"]]
             if not code or not str(code).strip():
                 continue
-            code = str(code).strip()
-            g = lambda k, d="": (str(row[idx[k]]).strip() if k in idx and idx[k] < len(row) and row[idx[k]] is not None else d)
-            gn = lambda k, d=0.0: (num(row[idx[k]], d) if k in idx and idx[k] < len(row) else d)
-            it = s.exec(select(Item).where(Item.item_code == code)).first()
+            groups.setdefault(str(code).strip(), []).append((rn, row))
+        # 2) write one record per code
+        for code, grp in groups.items():
+            rn, row = grp[0]
+            g = lambda k, d="", row=row: (str(row[idx[k]]).strip() if k in idx and idx[k] < len(row) and row[idx[k]] is not None else d)
+            gn = lambda k, d=0.0, r=None: (num(r[idx[k]], d) if k in idx and idx[k] < len(r) else d)
             fields = dict(category=g("category"), description=g("description"),
                           part_name=g("part_name"), part_number=g("part_number"),
                           brand=g("brand"), machine_group=g("machine_group"),
                           uom=g("uom", "Pcs") or "Pcs", box=g("box"), level=g("level"),
-                          unit_price=gn("unit_price"), min_level=gn("min_level"),
-                          reorder_point=gn("reorder_point"),
-                          lead_time_months=gn("lead_time_months", 2.0),
+                          unit_price=gn("unit_price", 0.0, row), min_level=gn("min_level", 0.0, row),
+                          reorder_point=gn("reorder_point", 0.0, row),
+                          lead_time_months=gn("lead_time_months", 2.0, row),
                           updated_at=datetime.utcnow())
-            oh = gn("on_hand")
+            oh = round(sum(gn("on_hand", 0.0, r) for _, r in grp), 6)
+            note = "Imported/updated via template"
+            if len(grp) > 1:
+                merged.append(code)
+                note = f"รวม {len(grp)} แถวใน template (แถว {', '.join(str(x[0]) for x in grp)})"
+            it = s.exec(select(Item).where(Item.item_code == code)).first()
             if it:
                 for k, v in fields.items():
                     setattr(it, k, v)
@@ -1104,8 +1107,7 @@ async def import_upload(file: UploadFile = File(...), replace: bool = False,
                 s.add(it)
             s.flush()
             s.add(StockTxn(item_id=it.id, item_code=code, txn_type="adjust",
-                           qty=oh, balance_after=oh, ref="IMPORT",
-                           note="Imported/updated via template", user_id=u.id))
+                           qty=oh, balance_after=oh, ref="IMPORT", note=note, user_id=u.id))
             n_items += 1
     if "Machines" in wb.sheetnames:
         ws = wb["Machines"]
@@ -1115,8 +1117,162 @@ async def import_upload(file: UploadFile = File(...), replace: bool = False,
             if name and str(name).strip() and str(name).strip() not in existing:
                 s.add(Machine(name=str(name).strip())); existing.add(str(name).strip()); n_mach += 1
     s.commit()
-    audit_log("import", f"items={n_items}, machines={n_mach}", user=u)
-    return {"ok": True, "items": n_items, "machines": n_mach}
+    audit_log("import", f"items={n_items}, machines={n_mach}, merged={len(merged)}", user=u)
+    return {"ok": True, "items": n_items, "machines": n_mach, "merged": merged}
+
+
+# --------------------------- public config --------------------------------
+@app.get("/api/config")
+def public_config():
+    """Non-secret settings the browser needs (time zone for date display)."""
+    return {"timezone": settings.TIMEZONE, "app": settings.APP_NAME,
+            "server_time_local": local_now().strftime("%d/%m/%Y %H:%M")}
+
+
+# --------------------------- create new item (admin) ----------------------
+class ItemCreate(BaseModel):
+    item_code: str
+    category: str = ""
+    part_name: str = ""
+    part_number: str = ""
+    brand: str = ""
+    description: str = ""
+    machine_group: str = ""
+    uom: str = "Pcs"
+    box: str = ""
+    level: str = ""
+    unit_price: float = 0.0
+    on_hand: float = 0.0
+    min_level: float = 0.0
+    reorder_point: float = 0.0
+    max_level: float = 0.0
+    lead_time_months: float = 2.0
+
+
+@app.post("/api/items")
+def create_item(payload: ItemCreate, s: Session = Depends(get_session),
+                u: User = Depends(require("admin"))):
+    code = (payload.item_code or "").strip()
+    if not code:
+        raise HTTPException(400, "กรุณาระบุรหัสอะไหล่")
+    dup = s.exec(select(Item).where(func.lower(func.trim(Item.item_code)) == code.lower())).first()
+    if dup:
+        raise HTTPException(400, f"รหัสอะไหล่ {dup.item_code} มีอยู่แล้วในระบบ")
+    data = payload.model_dump()
+    data["item_code"] = code
+    for k in ("category", "part_name", "part_number", "brand", "description",
+              "machine_group", "uom", "box", "level"):
+        data[k] = (data[k] or "").strip()
+    if not data["description"]:
+        data["description"] = " \\ ".join(x for x in (data["part_name"], data["part_number"], data["brand"]) if x)
+    it = Item(**data, source_sheet="manual", updated_at=datetime.utcnow())
+    s.add(it); s.flush()
+    # baseline ledger row: lets "reset test transactions" restore this starting stock
+    s.add(StockTxn(item_id=it.id, item_code=code, txn_type="receive", qty=it.on_hand or 0,
+                   balance_after=it.on_hand or 0, ref="CREATE", note="สร้างอะไหล่ใหม่",
+                   user_id=u.id))
+    s.commit()
+    audit_log("item", f"created new item {code}", user=u)
+    return {"ok": True, "item": item_dict(it)}
+
+
+# --------------------------- returns (leader/admin) -----------------------
+class ReturnIn(BaseModel):
+    line_id: int
+    qty: float
+    reason: str
+
+
+@app.post("/api/returns")
+async def create_return(payload: ReturnIn, s: Session = Depends(get_session),
+                        u: User = Depends(require("leader"))):
+    """Put withdrawn parts back into stock (e.g. wrong part taken) with a reason.
+    The requisition keeps a remark so the history stays auditable."""
+    ln = s.get(ReqLine, payload.line_id)
+    if not ln:
+        raise HTTPException(404, "ไม่พบรายการเบิก")
+    reason = (payload.reason or "").strip()
+    if not reason:
+        raise HTTPException(400, "กรุณาระบุเหตุผลการคืน")
+    if payload.qty <= 0:
+        raise HTTPException(400, "จำนวนคืนต้องมากกว่า 0")
+    req = s.get(Requisition, ln.requisition_id)
+    if not req or req.status not in ("confirmed", "reconciled"):
+        raise HTTPException(400, "คืนได้เฉพาะใบเบิกที่ยืนยันแล้ว")
+    it = s.get(Item, ln.item_id)
+    if not it:
+        raise HTTPException(404, "ไม่พบอะไหล่")
+    q = round(payload.qty, 6)
+    # atomic: only succeeds if the total returned stays <= withdrawn qty
+    res = s.execute(sa_update(ReqLine).where(
+        ReqLine.id == ln.id,
+        func.coalesce(ReqLine.returned_qty, 0) + q <= ReqLine.qty + 1e-9
+    ).values(returned_qty=func.coalesce(ReqLine.returned_qty, 0) + q)
+     .execution_options(synchronize_session=False))
+    if res.rowcount != 1:
+        s.rollback(); s.refresh(ln)
+        remaining = round((ln.qty or 0) - (ln.returned_qty or 0), 6)
+        raise HTTPException(400, f"คืนได้สูงสุด {remaining:g} (เบิก {ln.qty:g}, คืนแล้ว {ln.returned_qty or 0:g})")
+    bal = change_stock(s, it.id, q)                        # atomic
+    s.refresh(ln)
+    who = u.full_name or u.username
+    s.add(StockTxn(item_id=it.id, item_code=it.item_code, txn_type="return", qty=q,
+                   balance_after=bal, ref=req.ref_no if req else "", user_id=u.id,
+                   machine_name=req.machine_name if req else "", note=f"คืน: {reason}"))
+    s.add(ReturnLog(requisition_id=ln.requisition_id, reqline_id=ln.id, item_id=it.id,
+                    item_code=it.item_code, qty=q, reason=reason, returned_by=who))
+    s.commit(); s.refresh(it)
+    audit_log("return", f"{req.ref_no if req else ''} {it.item_code} +{payload.qty:g}: {reason}", user=u)
+    await notify("stock.received",
+                 f"↩️ คืนอะไหล่ {it.item_code} x{payload.qty:g} (ใบเบิก {req.ref_no if req else '-'})\n"
+                 f"เหตุผล: {reason}\nโดย: {who} · คงเหลือ {it.on_hand:g}",
+                 {"item": item_dict(it)})
+    return {"ok": True, "on_hand": it.on_hand, "returned_qty": ln.returned_qty}
+
+
+@app.get("/api/returns")
+def list_returns(limit: int = 200, s: Session = Depends(get_session),
+                 u: User = Depends(require("leader"))):
+    rows = s.exec(select(ReturnLog).order_by(ReturnLog.created_at.desc()).limit(limit)).all()
+    out = []
+    for x in rows:
+        req = s.get(Requisition, x.requisition_id)
+        out.append({"id": x.id, "ref_no": req.ref_no if req else "", "item_code": x.item_code,
+                    "qty": x.qty, "reason": x.reason, "by": x.returned_by, "at": x.created_at,
+                    "requester": req.requester_name if req else "",
+                    "machine": req.machine_name if req else ""})
+    return out
+
+
+# --------------------------- delete a requisition (admin) -----------------
+@app.delete("/api/requisitions/{req_id}")
+def delete_requisition(req_id: int, s: Session = Depends(get_session),
+                       u: User = Depends(require("admin"))):
+    """Remove a (test) requisition and give back the stock it took (net of any
+    returns already made), so on-hand goes back to where it was."""
+    req = s.get(Requisition, req_id)
+    if not req:
+        raise HTTPException(404, "ไม่พบใบเบิก")
+    was = req.status
+    if not claim(s, Requisition, req_id, was, "deleting"):   # only one delete may proceed
+        raise HTTPException(409, "ใบเบิกนี้กำลังถูกลบ/ถูกลบไปแล้ว")
+    lines = s.exec(select(ReqLine).where(ReqLine.requisition_id == req.id)).all()
+    restored = []
+    if was in ("confirmed", "reconciled"):
+        for ln in lines:
+            give_back = round((ln.qty or 0) - (ln.returned_qty or 0), 6)
+            it = s.get(Item, ln.item_id)
+            if it and give_back:
+                change_stock(s, it.id, give_back)          # atomic
+                restored.append(f"{it.item_code}+{give_back:g}")
+    s.query(StockTxn).filter(StockTxn.ref == req.ref_no).delete(synchronize_session=False)
+    s.query(ReturnLog).filter(ReturnLog.requisition_id == req.id).delete(synchronize_session=False)
+    s.query(ReqLine).filter(ReqLine.requisition_id == req.id).delete(synchronize_session=False)
+    images.drop_blobs(s, "req", req.id)
+    ref = req.ref_no
+    s.delete(req); s.commit()
+    audit_log("delete", f"deleted requisition {ref}; stock restored: {', '.join(restored) or '-'}", user=u)
+    return {"ok": True, "ref_no": ref, "restored": restored}
 
 
 # --------------------------- shutdown -------------------------------------
@@ -1131,6 +1287,22 @@ def shutdown(u: User = Depends(require("admin"))):
         os._exit(0)
     threading.Thread(target=_stop, daemon=True).start()
     return {"ok": True}
+
+
+@app.middleware("http")
+async def always_fresh_frontend(request, call_next):
+    """Browsers (especially phones) must re-check page files on every load, so an
+    update is never hidden behind an old cached app.js / styles.css."""
+    resp = await call_next(request)
+    p = request.url.path
+    if p == "/" or (p.endswith((".html", ".js", ".css")) and not p.startswith("/vendor/")):
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return resp
+
+
+from .admin import router as admin_router
+app.include_router(admin_router)
+app.include_router(images.router)
 
 
 # --------------------------- static frontend ------------------------------
