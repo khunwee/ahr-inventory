@@ -33,10 +33,7 @@ def run():
         if mach.exists():
             ie.import_machines(mach, s)
         enrich = ie.enrich_from_itemcode(cons) if cons.exists() else {}
-        if spare.exists():
-            ie.import_sheet(spare, "Machine Spare parts 2026", s, enrich, kind="spare")
-        if cons.exists():
-            ie.import_sheet(cons, "Tool And Facility", s, enrich, kind="tool")
+        ie.import_sources(s, spare, cons, enrich)
         print("[bootstrap] import complete")
 
 

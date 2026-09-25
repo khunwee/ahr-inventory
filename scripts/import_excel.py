@@ -121,18 +121,18 @@ def enrich_from_itemcode(path: Path):
     return out
 
 
-def import_sheet(path: Path, sheet: str, s: Session, enrich=None, kind="spare"):
+def read_sheet(path: Path, sheet: str, enrich=None, kind="spare"):
+    """Read one sheet into a list of row dicts (no database writes)."""
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb[sheet]
     enrich = enrich or {}
-    # column indices (1-based) differ slightly between the two layouts
     if kind == "spare":
         C = dict(box=4, level=5, code=6, desc=7, machine=8, uom=9, stock=10,
                  out_year=49, mn=54, mx=53, lead=57, receipt=58, price=62)
     else:  # tool/facility
         C = dict(box=4, level=5, code=6, desc=7, machine=8, uom=9, stock=10,
                  out_year=49, mn=None, mx=None, lead=None, receipt=None, price=None)
-    n = 0
+    rows = []
     for r in range(4, ws.max_row + 1):
         code = ws.cell(r, C["code"]).value
         if not code or not str(code).strip():
@@ -141,40 +141,92 @@ def import_sheet(path: Path, sheet: str, s: Session, enrich=None, kind="spare"):
         desc = str(ws.cell(r, C["desc"]).value or "").strip()
         name, pn, brand = parse_description(desc)
         info = enrich.get(code, {})
-        if not brand:
-            brand = info.get("brand", "")
-        stock = as_num(ws.cell(r, C["stock"]).value)
-        out_year = as_num(ws.cell(r, C["out_year"]).value) if C["out_year"] else 0
-        lead = as_num(ws.cell(r, C["lead"]).value, 2.0) if C["lead"] else 2.0
-        mn = as_num(ws.cell(r, C["mn"]).value) if C["mn"] else 0.0
-        mx = as_num(ws.cell(r, C["mx"]).value) if C["mx"] else 0.0
-        price = as_num(ws.cell(r, C["price"]).value) if C["price"] else 0.0
-        # practical reorder point: cover lead time from average monthly usage,
-        # never below the recorded minimum level
-        avg_month = out_year / 12.0
-        rop = max(mn, round(avg_month * lead, 1))
-        it = upsert_item(
-            s, code,
-            category=cat_of(code), description=desc,
-            part_name=name or info.get("history", ""), part_number=pn, brand=brand,
-            machine_group=str(ws.cell(r, C["machine"]).value or "").strip(),
+        rows.append(dict(
+            code=code, sheet=sheet, row=r, desc=desc,
+            name=name or info.get("history", ""), pn=pn, brand=brand or info.get("brand", ""),
+            machine=str(ws.cell(r, C["machine"]).value or "").strip(),
             uom=clean_uom(ws.cell(r, C["uom"]).value),
             box=str(ws.cell(r, C["box"]).value or "").strip(),
             level=str(ws.cell(r, C["level"]).value or "").strip(),
-            unit_price=price, on_hand=stock, min_level=mn,
-            max_level=max(mx, stock), reorder_point=rop, lead_time_months=lead,
-            source_sheet=sheet,
-            last_receipt=as_dt(ws.cell(r, C["receipt"]).value) if C["receipt"] else None,
-            updated_at=datetime.utcnow())
+            stock=as_num(ws.cell(r, C["stock"]).value),
+            out_year=as_num(ws.cell(r, C["out_year"]).value) if C["out_year"] else 0.0,
+            lead=as_num(ws.cell(r, C["lead"]).value, 2.0) if C["lead"] else 2.0,
+            mn=as_num(ws.cell(r, C["mn"]).value) if C["mn"] else 0.0,
+            mx=as_num(ws.cell(r, C["mx"]).value) if C["mx"] else 0.0,
+            price=as_num(ws.cell(r, C["price"]).value) if C["price"] else 0.0,
+            receipt=as_dt(ws.cell(r, C["receipt"]).value) if C["receipt"] else None))
+    return rows
+
+
+def _loc(r):
+    return " ".join(x for x in (r["box"], r["level"]) if x).strip()
+
+
+def import_rows(s: Session, rows):
+    """Write rows to the database, COMBINING rows that share a part code.
+
+    The source workbooks list some parts on more than one row (same part stored
+    in two boxes, or listed in both files). Physical stock is the SUM of those
+    rows — previously the last row silently overwrote the others, so on-hand
+    was wrong for those parts. Every merged part gets an opening-balance note
+    listing each source row, so it can be verified by a physical count."""
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["code"], []).append(r)
+    merged = []
+    for code, g in groups.items():
+        first = lambda k, d="": next((x[k] for x in g if x[k]), d)
+        stock = round(sum(x["stock"] for x in g), 6)
+        out_year = sum(x["out_year"] for x in g)
+        lead = first("lead", 2.0) or 2.0
+        mn = max(x["mn"] for x in g)
+        mx = max(x["mx"] for x in g)
+        rop = max(mn, round(out_year / 12.0 * lead, 1))
+        locs = []
+        for x in g:
+            if _loc(x) and _loc(x) not in locs:
+                locs.append(_loc(x))
+        if len(locs) > 1:
+            box, level = " + ".join(locs), ""
+        else:
+            box, level = first("box"), first("level")
+        receipts = [x["receipt"] for x in g if x["receipt"]]
+        it = upsert_item(
+            s, code, category=cat_of(code), description=first("desc"),
+            part_name=first("name"), part_number=first("pn"), brand=first("brand"),
+            machine_group=first("machine"), uom=first("uom", "Pcs") or "Pcs",
+            box=box, level=level, unit_price=first("price", 0.0) or 0.0, on_hand=stock,
+            min_level=mn, max_level=max(mx, stock), reorder_point=rop, lead_time_months=lead,
+            source_sheet=" + ".join(sorted({x["sheet"] for x in g})),
+            last_receipt=max(receipts) if receipts else None, updated_at=datetime.utcnow())
         s.flush()
-        # opening-balance ledger row so on_hand is always ledger-backed
-        if stock:
-            s.add(StockTxn(item_id=it.id, item_code=code, txn_type="receive",
-                           qty=stock, balance_after=stock, ref="OPENING",
-                           note="Opening balance from Excel"))
-        n += 1
+        if len(g) > 1:
+            parts = "; ".join(f"{x['sheet'][:18]} แถว {x['row']} [{_loc(x) or '-'}] = {x['stock']:g}" for x in g)
+            note = f"รวม {len(g)} แถวจากไฟล์ต้นฉบับ: {parts}"
+            merged.append({"code": code, "rows": len(g), "total": stock, "detail": parts})
+        else:
+            note = "Opening balance from Excel"
+        # opening balance ALWAYS recorded (also when 0) so the ledger explains on-hand
+        s.add(StockTxn(item_id=it.id, item_code=code, txn_type="receive", qty=stock,
+                       balance_after=stock, ref="OPENING", note=note[:1000]))
     s.commit()
-    print(f"  {sheet}: {n} items")
+    return {"items": len(groups), "rows": len(rows), "merged": merged}
+
+
+def import_sources(s: Session, spare: Path = None, cons: Path = None, enrich=None):
+    rows = []
+    if spare and spare.exists():
+        rows += read_sheet(spare, "Machine Spare parts 2026", enrich, kind="spare")
+    if cons and cons.exists():
+        rows += read_sheet(cons, "Tool And Facility", enrich, kind="tool")
+    rep = import_rows(s, rows)
+    print(f"  {rep['rows']} rows -> {rep['items']} parts ({len(rep['merged'])} parts combined from several rows)")
+    return rep
+
+
+def import_sheet(path: Path, sheet: str, s: Session, enrich=None, kind="spare"):
+    """Backward-compatible single-sheet import."""
+    return import_rows(s, read_sheet(path, sheet, enrich, kind))
 
 
 def main():
@@ -192,10 +244,7 @@ def main():
         if f_mach.exists():
             import_machines(f_mach, s)
         enrich = enrich_from_itemcode(f_cons) if f_cons.exists() else {}
-        if f_spare.exists():
-            import_sheet(f_spare, "Machine Spare parts 2026", s, enrich, kind="spare")
-        if f_cons.exists():
-            import_sheet(f_cons, "Tool And Facility", s, enrich, kind="tool")
+        import_sources(s, f_spare, f_cons, enrich)
         total = len(s.exec(select(Item)).all())
         print(f"Done. Total items in DB: {total}")
 
