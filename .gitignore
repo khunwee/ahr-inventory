@@ -1,0 +1,16 @@
+# never upload these to GitHub
+.venv/
+.buildenv/
+__pycache__/
+*.pyc
+.env
+data/*.db
+data/.req.stamp
+backups/*
+exports/*
+uploads/*
+!uploads/.gitkeep
+build/
+dist/
+!backups/.gitkeep
+!exports/.gitkeep

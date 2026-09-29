@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+data/*.db
+data/.req.stamp
+backups/*
+exports/*
+uploads/*
+build/
+dist/
+.buildenv/
