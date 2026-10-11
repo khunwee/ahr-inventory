@@ -75,6 +75,8 @@ def parse_num(v, default):
 
 def parse_workbook(data: bytes):
     from openpyxl import load_workbook
+    if len(data) > 20 * 1024 * 1024:
+        raise ImportError_("ไฟล์ใหญ่เกิน 20 MB — แบ่งไฟล์เป็นหลายส่วนแล้วนำเข้าทีละไฟล์")
     try:
         wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     except Exception:

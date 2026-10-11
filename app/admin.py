@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, func, text, LargeBinary
 import base64
 
+from .version import VERSION as APP_VERSION
 from .auth import require, verify_pw
 from .audit import log as audit_log
 from .config import settings, BASE_DIR, DATA_DIR
@@ -25,6 +26,7 @@ from .db import engine, SessionLocal, get_session, Session, _is_sqlite, init_db
 from .models import (Base, User, Machine, Item, Requisition, ReqLine, StockTxn,
                      PurchaseOrder, POLine, ReturnLog, AuditLog, Setting, ImageBlob)
 from .tz import local_now, fmt_local
+from .memtools import heavy_job, trim
 from .services import change_stock
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -78,7 +80,7 @@ def system_info(s: Session = Depends(get_session), u: User = Depends(ADMIN)):
         "db_size": _db_size_bytes(s), "counts": _counts(s),
         "server_time": local_now().strftime("%d/%m/%Y %H:%M:%S"), "timezone": settings.TIMEZONE,
         "uptime_min": round((time.time() - STARTED) / 60, 1),
-        "python": sys.version.split()[0], "solvers": solver_status(),
+        "python": sys.version.split()[0], "version": APP_VERSION, "solvers": solver_status(),
         "disk": disk, "weak_password_users": weak, "server_backups": backups,
         "image_bytes": s.execute(select(func.coalesce(func.sum(ImageBlob.size), 0))).scalar_one(),
         "items_with_photo": s.execute(select(func.count()).select_from(Item).where(Item.image_ver > 0)).scalar_one(),
@@ -87,11 +89,13 @@ def system_info(s: Session = Depends(get_session), u: User = Depends(ADMIN)):
 
 
 # ------------------------------------------------------------------ backup --
-def _workbook_bytes():
-    """Every table -> one sheet. Restorable with /restore."""
+def _write_backup(path):
+    """Every table -> one sheet, written row by row straight to a file
+    (openpyxl write-only + streamed DB cursor), so memory stays flat no matter
+    how many photos are stored. Restorable with /restore."""
     from openpyxl import Workbook
-    wb = Workbook()
-    meta = wb.active; meta.title = "_meta"
+    wb = Workbook(write_only=True)
+    meta = wb.create_sheet("_meta")
     meta.append(["app", settings.APP_NAME]); meta.append(["created", local_now().strftime("%d/%m/%Y %H:%M:%S")])
     meta.append(["format", "ahr-backup-v1"])
     with engine.connect() as conn:
@@ -100,7 +104,9 @@ def _workbook_bytes():
             cols = [c.name for c in table.columns]
             bins = [c.name for c in table.columns if isinstance(c.type, LargeBinary)]
             ws.append(cols + (["__part"] if bins else []))
-            for row in conn.execute(select(table)).mappings():
+            q = select(table).order_by(*table.primary_key.columns)
+            rows = conn.execution_options(stream_results=True, yield_per=20 if bins else 1000).execute(q).mappings()
+            for row in rows:
                 if not bins:
                     ws.append([row[c] for c in cols]); continue
                 enc = base64.b64encode(row[bins[0]] or b"").decode()
@@ -109,17 +115,29 @@ def _workbook_bytes():
                     vals = [row[c] if (k == 0 and c not in bins) else (part if c == bins[0] else (row[c] if c == "id" else None))
                             for c in cols]
                     ws.append(vals + [k])
-    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
-    return buf
+                del enc, parts
+    wb.save(path)
+
+
+def _tmp_xlsx():
+    fd, p = tempfile.mkstemp(prefix="ahr_backup_", suffix=".xlsx")
+    os.close(fd)
+    return p
 
 
 @router.get("/backup.xlsx")
 def backup_xlsx(u: User = Depends(ADMIN)):
-    buf = _workbook_bytes()
+    from starlette.background import BackgroundTask
+    with heavy_job():
+        path = _tmp_xlsx()
+        try:
+            _write_backup(path)
+        except Exception:
+            os.unlink(path); raise
     audit_log("backup", "downloaded full backup (xlsx)", user=u)
     fname = f"AHR_backup_{local_now():%Y%m%d_%H%M}.xlsx"
-    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                             headers={"Content-Disposition": f"attachment; filename={fname}"})
+    return FileResponse(path, filename=fname, background=BackgroundTask(os.unlink, path),
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @router.get("/backup.db")
@@ -141,7 +159,7 @@ def _snapshot_to_disk(tag):
     try:
         d = BASE_DIR / "backups"; d.mkdir(exist_ok=True)
         p = d / f"inventory_{tag}_{local_now():%Y%m%d_%H%M%S}.xlsx"
-        p.write_bytes(_workbook_bytes().getvalue())
+        _write_backup(str(p))
         for old in sorted(d.glob("inventory_pre-*.xlsx"), key=lambda f: f.stat().st_mtime)[:-10]:
             try:
                 old.unlink()                      # keep only the 10 newest safety copies
@@ -165,74 +183,112 @@ def _reset_sequences(conn):
                 f"COALESCE((SELECT MAX({pk[0].name}) FROM {t}), 0) + 1, false)"))
 
 
+def _coerce(t, rec):
+    for c in t.columns:                    # coerce to the column's python type
+        v = rec.get(c.name)
+        if v is None:
+            continue
+        try:
+            pt = c.type.python_type
+        except Exception:
+            continue
+        if pt is bytes:
+            continue
+        if pt is str and not isinstance(v, str):
+            rec[c.name] = str(v)
+        elif pt is bool:
+            rec[c.name] = bool(v) if not isinstance(v, str) else v.lower() in ("1", "true")
+        elif pt is float and isinstance(v, (int, str)):
+            rec[c.name] = float(v)
+        elif pt is int and isinstance(v, (float, str)):
+            rec[c.name] = int(float(v))
+    return rec
+
+
+def _restore_rows(t, ws):
+    """Yield table records from a read-only sheet, joining split binary rows."""
+    it = ws.iter_rows(values_only=True)
+    header = list(next(it, None) or [])
+    if not header:
+        return
+    valid = {c.name for c in t.columns}
+    bins = [c.name for c in t.columns if isinstance(c.type, LargeBinary)]
+    hi = {h: i for i, h in enumerate(header)}
+    if bins and "__part" in hi:
+        cur, buf = None, []
+        for r in it:
+            rid = r[hi["id"]] if hi["id"] < len(r) else None
+            if rid is None:
+                continue
+            if (r[hi["__part"]] or 0) == 0:
+                if cur is not None:
+                    cur[bins[0]] = base64.b64decode("".join(buf)); yield cur
+                cur = {h: v for h, v in zip(header, r) if h in valid}
+                buf = [cur.pop(bins[0], None) or ""]
+            elif cur is not None and cur.get("id") == rid:
+                buf.append(r[hi[bins[0]]] or "")
+        if cur is not None:
+            cur[bins[0]] = base64.b64decode("".join(buf)); yield cur
+    else:
+        for r in it:
+            yield {h: v for h, v in zip(header, r) if h in valid}
+
+
 @router.post("/restore")
 async def restore(file: UploadFile = File(...), confirm_text: str = Form(""),
                   u: User = Depends(ADMIN)):
     if confirm_text.strip() != CONFIRM_PHRASE:
         raise HTTPException(400, f"พิมพ์ '{CONFIRM_PHRASE}' เพื่อยืนยันการกู้คืน")
-    from openpyxl import load_workbook
+    # spool the upload to disk in chunks (never the whole file in memory)
+    fd, path = tempfile.mkstemp(prefix="ahr_restore_", suffix=".xlsx"); os.close(fd)
     try:
-        wb = load_workbook(io.BytesIO(await file.read()), data_only=True)
-    except Exception:
-        raise HTTPException(400, "ไฟล์ไม่ถูกต้อง — ต้องเป็นไฟล์สำรอง .xlsx ที่ดาวน์โหลดจากระบบนี้")
-    if "_meta" not in wb.sheetnames or "item" not in wb.sheetnames:
-        raise HTTPException(400, "ไม่ใช่ไฟล์สำรองของระบบนี้ (ไม่พบชีต _meta / item)")
-    safety = _snapshot_to_disk("pre-restore")
-    tables = [t for t in Base.metadata.sorted_tables if t.name in wb.sheetnames]
-    restored = {}
-    with engine.begin() as conn:
-        for t in reversed(Base.metadata.sorted_tables):       # children first
-            if t.name in wb.sheetnames:
-                conn.execute(t.delete())
-        for t in tables:                                       # parents first
-            ws = wb[t.name]
-            rows = list(ws.iter_rows(values_only=True))
-            if not rows:
-                continue
-            header = [h for h in rows[0]]
-            valid = {c.name for c in t.columns}
-            bins = [c.name for c in t.columns if isinstance(c.type, LargeBinary)]
-            if bins and "__part" in header:                      # join split binary rows
-                hi = {h: i for i, h in enumerate(header)}
-                joined = {}
-                for r in rows[1:]:
-                    rid = r[hi["id"]]
-                    if rid is None:
+        with open(path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(_do_restore, path, file.filename, u)
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+
+def _do_restore(path, filename, u):
+    from openpyxl import load_workbook
+    with heavy_job():
+        try:
+            wb = load_workbook(path, read_only=True, data_only=True)
+        except Exception:
+            raise HTTPException(400, "ไฟล์ไม่ถูกต้อง — ต้องเป็นไฟล์สำรอง .xlsx ที่ดาวน์โหลดจากระบบนี้")
+        try:
+            if "_meta" not in wb.sheetnames or "item" not in wb.sheetnames:
+                raise HTTPException(400, "ไม่ใช่ไฟล์สำรองของระบบนี้ (ไม่พบชีต _meta / item)")
+            safety = _snapshot_to_disk("pre-restore")
+            restored = {}
+            with engine.begin() as conn:
+                for t in reversed(Base.metadata.sorted_tables):       # children first
+                    if t.name in wb.sheetnames:
+                        conn.execute(t.delete())
+                for t in Base.metadata.sorted_tables:                 # parents first
+                    if t.name not in wb.sheetnames:
                         continue
-                    if (r[hi["__part"]] or 0) == 0:
-                        joined[rid] = list(r)
-                    elif rid in joined:
-                        joined[rid][hi[bins[0]]] = (joined[rid][hi[bins[0]]] or "") + (r[hi[bins[0]]] or "")
-                for rec in joined.values():
-                    rec[hi[bins[0]]] = base64.b64decode(rec[hi[bins[0]]] or "")
-                rows = [rows[0]] + [tuple(v) for v in joined.values()]
-            batch = []
-            for r in rows[1:]:
-                rec = {h: v for h, v in zip(header, r) if h in valid}
-                for c in t.columns:            # coerce to the column's python type
-                    v = rec.get(c.name)
-                    if v is None:
-                        continue
-                    try:
-                        pt = c.type.python_type
-                    except Exception:
-                        continue
-                    if pt is bytes:
-                        continue
-                    if pt is str and not isinstance(v, str):
-                        rec[c.name] = str(v)
-                    elif pt is bool:
-                        rec[c.name] = bool(v) if not isinstance(v, str) else v.lower() in ("1", "true")
-                    elif pt is float and isinstance(v, (int, str)):
-                        rec[c.name] = float(v)
-                    elif pt is int and isinstance(v, (float, str)):
-                        rec[c.name] = int(float(v))
-                batch.append(rec)
-            if batch:
-                conn.execute(t.insert(), batch)
-            restored[t.name] = len(batch)
-        _reset_sequences(conn)
-    audit_log("restore", f"restored from backup {file.filename}: {restored}", user=u)
+                    is_bin = any(isinstance(c.type, LargeBinary) for c in t.columns)
+                    size, batch, n = (20 if is_bin else 500), [], 0
+                    for rec in _restore_rows(t, wb[t.name]):
+                        batch.append(_coerce(t, rec)); n += 1
+                        if len(batch) >= size:
+                            conn.execute(t.insert(), batch); batch = []
+                    if batch:
+                        conn.execute(t.insert(), batch)
+                    restored[t.name] = n
+                _reset_sequences(conn)
+        finally:
+            wb.close()
+    audit_log("restore", f"restored from backup {filename}: {restored}", user=u)
     return {"ok": True, "restored": restored, "safety_copy": safety}
 
 
@@ -503,6 +559,11 @@ def reset(payload: ResetIn, u: User = Depends(ADMIN)):
         raise HTTPException(400, f"พิมพ์ '{CONFIRM_PHRASE}' ให้ถูกต้องเพื่อยืนยัน")
     if payload.mode not in ("transactions", "factory", "empty"):
         raise HTTPException(400, "unknown mode")
+    with heavy_job():
+        return _do_reset(payload, u)
+
+
+def _do_reset(payload, u):
     safety = _snapshot_to_disk(f"pre-{payload.mode}")
     result = {}
     with SessionLocal() as s:

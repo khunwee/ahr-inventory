@@ -349,3 +349,7 @@ tr.row-sel td{background:var(--brand-soft) !important}
 .imp-opts .opt:has(input[type=radio]:checked){border-color:var(--brand);background:var(--brand-soft)}
 .imp-opts .opt.danger:has(input[type=radio]:checked){border-color:var(--crit);background:#fff5f5}
 @media (max-width:600px){ .imp-cards{grid-template-columns:1fr 1fr} .selbar .btn{flex:1 1 auto} }
+
+/* v2.8.2 download progress */
+.toast.busy{border-left-color:var(--warn,#e0a800)}
+button:disabled{opacity:.6;cursor:wait}

@@ -23,6 +23,7 @@ from .models import (User, Machine, Item, Requisition, ReqLine, StockTxn,
 from .auth import hash_pw, verify_pw, make_token, current_user, require, ROLE_RANK
 from .notifications import ws_manager, notify, test_channel
 from .scheduler import start_scheduler
+from . import memtools  # noqa: F401  (limits malloc arenas before worker threads start)
 from . import settings_store, linebot, labels, images, importer
 from .audit import log as audit_log
 from .services import (issue_requisition, confirm_message, reorder_message, change_stock, claim,
@@ -1114,7 +1115,8 @@ async def _parse_upload(file):
 async def import_preview(file: UploadFile = File(...), s: Session = Depends(get_session),
                          u: User = Depends(require("admin"))):
     """Check the file against the database. Writes NOTHING."""
-    return importer.analyze(s, await _parse_upload(file))
+    with memtools.heavy_job():
+        return importer.analyze(s, await _parse_upload(file))
 
 
 @app.post("/api/import/upload")
@@ -1128,8 +1130,9 @@ async def import_upload(file: UploadFile = File(...), replace: bool = False,
     if mode == "replace" and confirm_text.strip() != "ยืนยันล้างข้อมูล":
         raise HTTPException(400, "พิมพ์ 'ยืนยันล้างข้อมูล' เพื่อยืนยันการล้างข้อมูลเดิม")
     try:
-        res = importer.apply(s, parsed, mode=mode, dup_rows=dup_rows, update_stock=update_stock,
-                             skip_codes=[c for c in skip_codes.split(",") if c.strip()], user_id=u.id)
+        with memtools.heavy_job():
+            res = importer.apply(s, parsed, mode=mode, dup_rows=dup_rows, update_stock=update_stock,
+                                 skip_codes=[c for c in skip_codes.split(",") if c.strip()], user_id=u.id)
     except importer.ImportError_ as e:
         s.rollback(); raise HTTPException(400, str(e))
     audit_log("import", f"{file.filename} mode={mode} dup={dup_rows} stock={update_stock}: {res}", user=u)
@@ -1302,6 +1305,18 @@ def shutdown(u: User = Depends(require("admin"))):
         os._exit(0)
     threading.Thread(target=_stop, daemon=True).start()
     return {"ok": True}
+
+
+HEAVY_PATHS = ("/api/export/", "/api/import/", "/api/labels/batch", "/api/admin/", "/api/optimize/")
+
+
+@app.middleware("http")
+async def release_memory_after_heavy(request, call_next):
+    """Give memory back to the OS after big exports/imports (small hosts)."""
+    resp = await call_next(request)
+    if request.url.path.startswith(HEAVY_PATHS):
+        memtools.trim()
+    return resp
 
 
 @app.middleware("http")

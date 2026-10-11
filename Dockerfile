@@ -11,6 +11,8 @@ COPY . .
 
 # hosts inject $PORT; default 8770 for local docker runs
 ENV PORT=8770
+# keep memory flat on small hosts (Render free = 512 MB)
+ENV MALLOC_ARENA_MAX=2 PYTHONUNBUFFERED=1
 
 # On boot: create tables + seed admin (via app) and load sample data only if
 # the database is empty, then start the web server on the host's port.

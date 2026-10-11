@@ -279,7 +279,7 @@ if (LANG === "en") translateTree(document.body, true);
 /* ---------------- toast / modal ---------------- */
 function toast(msg, kind = "") {
   const t = document.createElement("div"); t.className = "toast " + kind; t.textContent = msg;
-  $("#toasts").appendChild(t); setTimeout(() => t.remove(), 5000);
+  $("#toasts").appendChild(t); setTimeout(() => t.remove(), kind === "crit" ? 15000 : 6000);
 }
 function modal(title, bodyHTML, footHTML) {
   $("#modal-root").innerHTML = `<div class="modal-bg"><div class="modal">
@@ -1259,16 +1259,55 @@ function printPO(po, val) {
     </body></html>`);
   w.document.close(); w.print();
 }
-async function downloadAuthed(url, filename) {
+const _dlBusy = new Set();
+function downloadErr(status, detail) {
+  if (status === 429) return detail || "ระบบกำลังทำงานหนักอื่นอยู่ — รอสักครู่แล้วลองใหม่";
+  if (status === 502 || status === 503 || status === 504)
+    return `เซิร์ฟเวอร์ไม่ตอบ (${status}) — อาจกำลังรีสตาร์ทหรือหน่วยความจำเต็ม รอ 1–2 นาทีแล้วลองใหม่`;
+  if (status === 401) return "หมดเวลาเข้าสู่ระบบ — กรุณาเข้าสู่ระบบใหม่";
+  return detail || ("HTTP " + status);
+}
+async function downloadAuthed(url, filename, opts = {}) {
+  if (_dlBusy.has(url)) return toast("กำลังดาวน์โหลดไฟล์นี้อยู่ — กรุณารอ", "");
+  _dlBusy.add(url);
+  const btn = opts.btn || null, oldTxt = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ " + (opts.busyText || "กำลังเตรียมไฟล์…"); }
+  const t = document.createElement("div"); t.className = "toast busy";
+  $("#toasts").appendChild(t);
+  const t0 = Date.now(); let got = 0, total = 0, phase = opts.busyText || "กำลังเตรียมไฟล์";
+  const paint = () => {
+    const sec = Math.round((Date.now() - t0) / 1000);
+    t.textContent = got
+      ? `⬇ ${filename}: ${(got / 1048576).toFixed(1)}${total ? " / " + (total / 1048576).toFixed(1) : ""} MB · ${sec} วิ`
+      : `⏳ ${phase}… ${sec} วิ${opts.hint ? " — " + opts.hint : ""}`;
+  };
+  paint(); const tick = setInterval(paint, 1000);
   try {
     const r = await fetch(url, { headers: { Authorization: "Bearer " + S.token } });
-    if (!r.ok) { const e = await r.json().catch(() => ({})); return toast("ดาวน์โหลดไม่สำเร็จ: " + (e.detail || r.status), "crit"); }
-    const blob = await r.blob(); const a = document.createElement("a");
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      return toast("ดาวน์โหลดไม่สำเร็จ: " + downloadErr(r.status, e.detail), "crit");
+    }
+    total = +r.headers.get("content-length") || 0;
+    const parts = [];
+    if (r.body && r.body.getReader) {
+      const rd = r.body.getReader();
+      for (;;) { const { done, value } = await rd.read(); if (done) break; parts.push(value); got += value.length; }
+    } else { const b = await r.blob(); parts.push(b); got = b.size; }
+    if (total && got < total) throw new Error("การเชื่อมต่อขาดระหว่างดาวน์โหลด");
+    const blob = new Blob(parts, { type: r.headers.get("content-type") || "application/octet-stream" });
+    const a = document.createElement("a");
     a.href = URL.createObjectURL(blob); a.download = filename;
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    toast("ดาวน์โหลด " + filename, "ok");
-  } catch (e) { toast("ดาวน์โหลดไม่สำเร็จ: " + e.message, "crit"); }
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    toast(`ดาวน์โหลด ${filename} (${(blob.size / 1048576).toFixed(1)} MB) แล้ว — ดูในโฟลเดอร์ Downloads`, "ok");
+  } catch (e) {
+    toast("ดาวน์โหลดไม่สำเร็จ: " + (e.message === "Failed to fetch" || e.name === "TypeError"
+      ? "การเชื่อมต่อกับเซิร์ฟเวอร์ขาด (เซิร์ฟเวอร์อาจรีสตาร์ท) — รอ 1–2 นาทีแล้วลองใหม่" : e.message), "crit");
+  } finally {
+    clearInterval(tick); t.remove(); _dlBusy.delete(url);
+    if (btn) { btn.disabled = false; btn.textContent = oldTxt; }
+  }
 }
 
 /* ---------- printing: hidden in-page frame (no pop-up, never blank) ---------- */
@@ -1511,6 +1550,7 @@ VIEWS.admintools = async () => {
         <div>ขนาดฐานข้อมูล</div><div>${fmtBytes(sys.db_size)}</div>
         <div>เวลาเซิร์ฟเวอร์</div><div>${esc(sys.server_time)} (${esc(sys.timezone)})</div>
         <div>ทำงานต่อเนื่อง</div><div>${num(sys.uptime_min)} นาที</div>
+        <div>เวอร์ชันโปรแกรม</div><div><b>v${esc(sys.version || "?")}</b></div>
         <div>Python</div><div>${esc(sys.python)}</div>
         <div>Optimization</div><div>${sys.solvers.minizinc ? "MiniZinc ✓" : "MiniZinc ✗"} · ${sys.solvers.pulp ? "PuLP ✓" : "PuLP ✗"}</div>
         ${sys.disk ? `<div>พื้นที่ดิสก์ว่าง</div><div>${sys.disk.free_gb} / ${sys.disk.total_gb} GB</div>` : ""}
@@ -1547,7 +1587,7 @@ VIEWS.admintools = async () => {
       </div></div>`;
 
   renderPhotoPanel();
-  $("#ad-bk-xlsx").onclick = () => downloadAuthed("/api/admin/backup.xlsx", `AHR_backup_${todayDmy().split("/").reverse().join("")}.xlsx`);
+  $("#ad-bk-xlsx").onclick = (e) => downloadAuthed("/api/admin/backup.xlsx", `AHR_backup_${todayDmy().split("/").reverse().join("")}.xlsx`, { btn: e.currentTarget, busyText: "กำลังสร้างไฟล์สำรอง", hint: "ถ้ามีรูปมากอาจใช้เวลา 1–2 นาที อย่าปิดหน้านี้" });
   if ($("#ad-bk-db")) $("#ad-bk-db").onclick = () => downloadAuthed("/api/admin/backup.db", `AHR_inventory_${todayDmy().split("/").reverse().join("")}.db`);
   $("#ad-rs-go").onclick = () => {
     const f = $("#ad-rs-file").files[0];
@@ -1644,7 +1684,7 @@ async function renderPhotoPanel() {
 function stepOneConfirm(title, messageHTML, next) {
   modal(`⚠️ ${title}`, messageHTML + `<div class="panel" style="padding:10px 12px;margin-top:12px;background:var(--watch-soft)">💾 แนะนำ: ดาวน์โหลดสำรองข้อมูลก่อนดำเนินการ<br><button class="btn sm" id="s1-bk" style="margin-top:8px">⤓ ดาวน์โหลดสำรอง (Excel)</button></div>`,
     `<button class="btn" data-close>ยกเลิก</button><button class="btn danger" id="s1-next">ดำเนินการต่อ →</button>`);
-  $("#s1-bk").onclick = () => downloadAuthed("/api/admin/backup.xlsx", `AHR_backup_${todayDmy().split("/").reverse().join("")}.xlsx`);
+  $("#s1-bk").onclick = (e) => downloadAuthed("/api/admin/backup.xlsx", `AHR_backup_${todayDmy().split("/").reverse().join("")}.xlsx`, { btn: e.currentTarget, busyText: "กำลังสร้างไฟล์สำรอง", hint: "ถ้ามีรูปมากอาจใช้เวลา 1–2 นาที อย่าปิดหน้านี้" });
   $("#s1-next").onclick = () => next();
 }
 
