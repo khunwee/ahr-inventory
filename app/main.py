@@ -23,7 +23,7 @@ from .models import (User, Machine, Item, Requisition, ReqLine, StockTxn,
 from .auth import hash_pw, verify_pw, make_token, current_user, require, ROLE_RANK
 from .notifications import ws_manager, notify, test_channel
 from .scheduler import start_scheduler
-from . import settings_store, linebot, labels, images
+from . import settings_store, linebot, labels, images, importer
 from .audit import log as audit_log
 from .services import (issue_requisition, confirm_message, reorder_message, change_stock, claim,
                        next_number, save_with_number)
@@ -922,9 +922,42 @@ def label_svg(item_id: int, s: Session = Depends(get_session)):
     return Response(content=labels.qr_svg(it.item_code), media_type="image/svg+xml")
 
 
+class LabelBatchIn(BaseModel):
+    ids: list[int]
+    kind: str = "qr"                  # qr | barcode | both
+
+
+@app.post("/api/labels/batch")
+def label_batch(p: LabelBatchIn, s: Session = Depends(get_session), u: User = Depends(current_user)):
+    """QR and/or Code 128 barcode SVGs for many parts in one request (label printing)."""
+    if p.kind not in ("qr", "barcode", "both"):
+        raise HTTPException(400, "kind must be qr, barcode or both")
+    ids = list(dict.fromkeys(p.ids))[:2000]
+    items = {it.id: it for it in s.execute(select(Item).where(Item.id.in_(ids))).scalars()} if ids else {}
+    out = []
+    for i in ids:
+        it = items.get(i)
+        if not it:
+            continue
+        rec = {"id": it.id, "code": it.item_code, "name": it.part_name or (it.description or "")[:40],
+               "box": it.box or "", "level": it.level or "", "uom": it.uom or ""}
+        if p.kind in ("qr", "both"):
+            rec["qr"] = labels.qr_svg(it.item_code)
+        if p.kind in ("barcode", "both"):
+            try:
+                rec["barcode"] = labels.barcode_svg(it.item_code)
+            except ValueError:                       # e.g. Thai letters in a code
+                rec["barcode"] = ""
+                rec["barcode_error"] = "รหัสมีอักขระที่บาร์โค้ด Code 128 ไม่รองรับ — ใช้ QR แทน"
+        out.append(rec)
+    return out
+
+
 @app.get("/api/items/by-code/{code}")
 def item_by_code(code: str, s: Session = Depends(get_session), u: User = Depends(current_user)):
-    it = s.exec(select(Item).where(Item.item_code == code.strip())).first()
+    code = code.strip()
+    it = s.exec(select(Item).where(Item.item_code == code)).first() or \
+        s.exec(select(Item).where(func.upper(Item.item_code) == code.upper())).first()
     if not it:
         raise HTTPException(404, "Item not found")
     return item_dict(it)
@@ -1070,87 +1103,37 @@ def import_template(u: User = Depends(require("admin"))):
                              headers={"Content-Disposition": "attachment; filename=import_template.xlsx"})
 
 
+async def _parse_upload(file):
+    try:
+        return importer.parse_workbook(await file.read())
+    except importer.ImportError_ as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/import/preview")
+async def import_preview(file: UploadFile = File(...), s: Session = Depends(get_session),
+                         u: User = Depends(require("admin"))):
+    """Check the file against the database. Writes NOTHING."""
+    return importer.analyze(s, await _parse_upload(file))
+
+
 @app.post("/api/import/upload")
 async def import_upload(file: UploadFile = File(...), replace: bool = False,
+                        mode: str = Form(""), dup_rows: str = Form("first"),
+                        update_stock: bool = Form(False), skip_codes: str = Form(""),
+                        confirm_text: str = Form(""),
                         s: Session = Depends(get_session), u: User = Depends(require("admin"))):
-    """Import items + machines from a filled template. Upserts by item_code.
-    If replace=True, wipes existing items/machines/stock/requisitions/POs first
-    so the site can start fresh on a new dataset."""
-    from openpyxl import load_workbook
-    data = await file.read()
+    parsed = await _parse_upload(file)
+    mode = mode or ("replace" if replace else "update")
+    if mode == "replace" and confirm_text.strip() != "ยืนยันล้างข้อมูล":
+        raise HTTPException(400, "พิมพ์ 'ยืนยันล้างข้อมูล' เพื่อยืนยันการล้างข้อมูลเดิม")
     try:
-        wb = load_workbook(io.BytesIO(data), data_only=True)
-    except Exception:
-        raise HTTPException(400, "ไฟล์ไม่ถูกต้อง (ต้องเป็น .xlsx)")
-
-    if replace:
-        for m in (POLine, PurchaseOrder, ReqLine, Requisition, StockTxn, Item, Machine):
-            s.query(m).delete()
-        s.commit()
-
-    def num(v, d=0.0):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return d
-
-    n_items = n_mach = 0
-    merged = []
-    if "Items" in wb.sheetnames:
-        ws = wb["Items"]
-        header = [str(c.value).strip() if c.value else "" for c in ws[1]]
-        idx = {name: header.index(name) for name in IMPORT_COLS if name in header}
-        if "item_code" not in idx:
-            raise HTTPException(400, "ไม่พบคอลัมน์ item_code ในชีต Items")
-        # 1) read + group rows by part code (duplicates are COMBINED: stock summed)
-        groups = {}
-        for rn, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            if not row or idx["item_code"] >= len(row):
-                continue
-            code = row[idx["item_code"]]
-            if not code or not str(code).strip():
-                continue
-            groups.setdefault(str(code).strip(), []).append((rn, row))
-        # 2) write one record per code
-        for code, grp in groups.items():
-            rn, row = grp[0]
-            g = lambda k, d="", row=row: (str(row[idx[k]]).strip() if k in idx and idx[k] < len(row) and row[idx[k]] is not None else d)
-            gn = lambda k, d=0.0, r=None: (num(r[idx[k]], d) if k in idx and idx[k] < len(r) else d)
-            fields = dict(category=g("category"), description=g("description"),
-                          part_name=g("part_name"), part_number=g("part_number"),
-                          brand=g("brand"), machine_group=g("machine_group"),
-                          uom=g("uom", "Pcs") or "Pcs", box=g("box"), level=g("level"),
-                          unit_price=gn("unit_price", 0.0, row), min_level=gn("min_level", 0.0, row),
-                          reorder_point=gn("reorder_point", 0.0, row),
-                          lead_time_months=gn("lead_time_months", 2.0, row),
-                          updated_at=datetime.utcnow())
-            oh = round(sum(gn("on_hand", 0.0, r) for _, r in grp), 6)
-            note = "Imported/updated via template"
-            if len(grp) > 1:
-                merged.append(code)
-                note = f"รวม {len(grp)} แถวใน template (แถว {', '.join(str(x[0]) for x in grp)})"
-            it = s.exec(select(Item).where(Item.item_code == code)).first()
-            if it:
-                for k, v in fields.items():
-                    setattr(it, k, v)
-                it.on_hand = oh
-            else:
-                it = Item(item_code=code, on_hand=oh, **fields)
-                s.add(it)
-            s.flush()
-            s.add(StockTxn(item_id=it.id, item_code=code, txn_type="adjust",
-                           qty=oh, balance_after=oh, ref="IMPORT", note=note, user_id=u.id))
-            n_items += 1
-    if "Machines" in wb.sheetnames:
-        ws = wb["Machines"]
-        existing = {m.name for m in s.exec(select(Machine)).all()}
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            name = row[0] if row else None
-            if name and str(name).strip() and str(name).strip() not in existing:
-                s.add(Machine(name=str(name).strip())); existing.add(str(name).strip()); n_mach += 1
-    s.commit()
-    audit_log("import", f"items={n_items}, machines={n_mach}, merged={len(merged)}", user=u)
-    return {"ok": True, "items": n_items, "machines": n_mach, "merged": merged}
+        res = importer.apply(s, parsed, mode=mode, dup_rows=dup_rows, update_stock=update_stock,
+                             skip_codes=[c for c in skip_codes.split(",") if c.strip()], user_id=u.id)
+    except importer.ImportError_ as e:
+        s.rollback(); raise HTTPException(400, str(e))
+    audit_log("import", f"{file.filename} mode={mode} dup={dup_rows} stock={update_stock}: {res}", user=u)
+    return {"ok": True, "mode": mode, **res, "items": res["added"] + res["updated"], "machines": res["machines_added"]}
 
 
 # --------------------------- public config --------------------------------

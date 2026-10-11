@@ -1,5 +1,5 @@
 /* AHR Maintenance Inventory — frontend SPA (vanilla JS) */
-const S = { token: localStorage.getItem("tok") || "", user: null, cart: [], ws: null, wsWanted: false, machines: [], tz: "Asia/Bangkok" };
+const S = { labelSel: new Map(), token: localStorage.getItem("tok") || "", user: null, cart: [], ws: null, wsWanted: false, machines: [], tz: "Asia/Bangkok" };
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = (t) => (t ?? "").toString().replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -179,7 +179,7 @@ async function doLogin() {
 }
 function logout() {
   fetch("/api/auth/logout", { method: "POST" }).catch(() => { });
-  S.token = ""; S.user = null; S.cart = []; localStorage.removeItem("tok");
+  S.token = ""; S.user = null; S.cart = []; S.labelSel.clear(); localStorage.removeItem("tok");
   S.wsWanted = false; if (S.ws) { try { S.ws.close(); } catch { } S.ws = null; }
   closeModal(); document.body.classList.remove("nav-open");
   $("#content").innerHTML = "";
@@ -369,9 +369,10 @@ VIEWS.inventory = async () => {
       ${can("admin") ? `<button class="btn primary" id="inv-new" style="align-self:flex-end">+ เพิ่มอะไหล่ใหม่</button>` : ""}
       <button class="btn" id="inv-xlsx" style="align-self:flex-end">⤓ Excel</button>
       <button class="btn" id="inv-print" style="align-self:flex-end">🖶 พิมพ์/PDF</button>
-      <button class="btn" id="inv-qr" style="align-self:flex-end">🏷️ QR</button>
+      <button class="btn" id="inv-qr" style="align-self:flex-end">🏷️ พิมพ์ป้าย QR / บาร์โค้ด</button>
     </div>
     <div id="inv-count" class="section-note" style="margin:-4px 0 8px"></div>
+    <div id="inv-selbar" class="selbar"></div>
     <div class="panel"><div class="table-wrap" style="max-height:66vh;overflow:auto"><table id="inv-tbl"></table>
       <div id="inv-more" style="padding:12px;text-align:center"></div></div></div>`;
     // category + machine lists come from ALL parts (with counts), not from the loaded page
@@ -390,7 +391,7 @@ VIEWS.inventory = async () => {
     return p;
   };
   const rowHTML = (it) => `
-      <tr><td class="thumb-cell">${thumbHTML(it)}</td><td class="code"><a href="#" data-view-item="${it.id}">${esc(it.item_code)}</a></td>
+      <tr class="${S.labelSel.has(it.id) ? "row-sel" : ""}"><td class="sel-cell"><input type="checkbox" data-sel="${it.id}" ${S.labelSel.has(it.id) ? "checked" : ""} aria-label="เลือกพิมพ์ป้าย ${esc(it.item_code)}"></td><td class="thumb-cell">${thumbHTML(it)}</td><td class="code"><a href="#" data-view-item="${it.id}">${esc(it.item_code)}</a></td>
       <td><div>${esc(it.part_name || it.description.slice(0, 50))}</div><div class="muted" style="font-size:12px">${esc(it.part_number)} ${it.brand ? "· " + esc(it.brand) : ""}</div></td>
       <td class="muted">${esc(it.machine_group)}</td><td class="muted">${esc(it.box)} ${esc(it.level)}</td>
       <td class="num">${num(it.on_hand)}</td><td class="muted">${esc(it.uom)}</td><td class="num">${num(it.reorder_point)}</td>
@@ -402,22 +403,53 @@ VIEWS.inventory = async () => {
     if (!$("#inv-tbl")) return;
     lastRows = d.rows; lastTotal = d.total;
     $("#inv-count").innerHTML = d.total ? `แสดง <b>${num(d.rows.length)}</b> จาก <b>${num(d.total)}</b> รายการ` : "";
-    $("#inv-tbl").innerHTML = `<thead><tr><th></th><th>รหัส</th><th>รายละเอียด</th><th>เครื่อง</th><th>ที่เก็บ</th><th class="num">คงเหลือ</th><th>หน่วย</th><th class="num">ROP</th><th>สถานะ</th><th></th></tr></thead><tbody>${d.rows.map(rowHTML).join("") || `<tr><td colspan="10" class="muted" style="padding:24px;text-align:center">ไม่พบรายการ — ลองพิมพ์คำอื่น หรือเปลี่ยนหมวด/เครื่อง</td></tr>`}</tbody>`;
+    $("#inv-tbl").innerHTML = `<thead><tr><th class="sel-cell"><input type="checkbox" id="inv-selall" title="เลือก/ไม่เลือก ทุกรายการที่แสดง"></th><th></th><th>รหัส</th><th>รายละเอียด</th><th>เครื่อง</th><th>ที่เก็บ</th><th class="num">คงเหลือ</th><th>หน่วย</th><th class="num">ROP</th><th>สถานะ</th><th></th></tr></thead><tbody>${d.rows.map(rowHTML).join("") || `<tr><td colspan="11" class="muted" style="padding:24px;text-align:center">ไม่พบรายการ — ลองพิมพ์คำอื่น หรือเปลี่ยนหมวด/เครื่อง</td></tr>`}</tbody>`;
     const left = d.total - d.rows.length;
     $("#inv-more").innerHTML = left > 0
       ? `<button class="btn" id="inv-more-btn">แสดงเพิ่ม (${num(Math.min(INV_PAGE, left))})</button> <button class="btn ghost" id="inv-all-btn">แสดงทั้งหมด (${num(d.total)})</button>` : "";
     if ($("#inv-more-btn")) $("#inv-more-btn").onclick = () => { S.invShown += INV_PAGE; run(false); };
     if ($("#inv-all-btn")) $("#inv-all-btn").onclick = () => { S.invShown = d.total; run(false); };
-    $$("#inv-tbl [data-qr]").forEach(b => b.onclick = () => printLabels([{ id: +b.dataset.qr, code: b.dataset.code, name: b.dataset.name }]));
+    $$("#inv-tbl [data-qr]").forEach(b => b.onclick = () => labelPrintModal([{ id: +b.dataset.qr, code: b.dataset.code, name: b.dataset.name }]));
     $$("#inv-tbl [data-edit]").forEach(b => b.onclick = () => itemEditModal(lastRows.find(x => x.id == b.dataset.edit), () => run(false)));
+    $$("#inv-tbl [data-sel]").forEach(cb => cb.onchange = () => {
+      const it = lastRows.find(x => x.id == cb.dataset.sel);
+      if (cb.checked) S.labelSel.set(it.id, { id: it.id, code: it.item_code, name: (it.part_name || "").slice(0, 30) });
+      else S.labelSel.delete(it.id);
+      cb.closest("tr").classList.toggle("row-sel", cb.checked); syncSel();
+    });
+    $("#inv-selall").onchange = () => {
+      const on = $("#inv-selall").checked;
+      lastRows.forEach(it => on ? S.labelSel.set(it.id, { id: it.id, code: it.item_code, name: (it.part_name || "").slice(0, 30) }) : S.labelSel.delete(it.id));
+      $$("#inv-tbl [data-sel]").forEach(cb => { cb.checked = on; cb.closest("tr").classList.toggle("row-sel", on); });
+      syncSel();
+    };
+    syncSel();
+  };
+  // selection bar: count + actions (selection survives search / filter / paging)
+  const syncSel = () => {
+    const n = S.labelSel.size, bar = $("#inv-selbar"); if (!bar) return;
+    const shown = lastRows.length && lastRows.every(it => S.labelSel.has(it.id));
+    if ($("#inv-selall")) { $("#inv-selall").checked = shown; $("#inv-selall").indeterminate = !shown && lastRows.some(it => S.labelSel.has(it.id)); }
+    bar.innerHTML = n
+      ? `<b>เลือกไว้ ${num(n)} รายการ</b><button class="btn sm primary" id="sel-print">🏷️ พิมพ์ป้ายที่เลือก</button>
+         ${lastTotal > lastRows.length || !shown ? `<button class="btn sm" id="sel-all">เลือกทั้งหมดที่ตรงตัวกรอง (${num(lastTotal)})</button>` : ""}
+         <button class="btn sm ghost" id="sel-clear">ล้างการเลือก</button>`
+      : `<span class="muted">☑ ติ๊กช่องหน้ารายการเพื่อเลือกอะไหล่ที่ต้องการพิมพ์ป้าย — ค้นหา/เปลี่ยนตัวกรองแล้วเลือกเพิ่มได้ รายการที่เลือกไว้จะไม่หาย</span>`;
+    if ($("#sel-print")) $("#sel-print").onclick = () => labelPrintModal([...S.labelSel.values()]);
+    if ($("#sel-clear")) $("#sel-clear").onclick = () => { S.labelSel.clear(); run(false); };
+    if ($("#sel-all")) $("#sel-all").onclick = async () => {
+      const rows = await allMatching();
+      if (S.labelSel.size + rows.length > 2000) return toast("เลือกได้สูงสุด 2,000 รายการต่อครั้ง — กรองให้แคบลง", "crit");
+      rows.forEach(it => S.labelSel.set(it.id, { id: it.id, code: it.item_code, name: (it.part_name || "").slice(0, 30) }));
+      toast(`เลือกเพิ่ม ${num(rows.length)} รายการ`, "ok"); run(false);
+    };
   };
   // everything that matches the filters (not only the loaded rows)
   const allMatching = async () => { const p = params(); p.set("limit", 5000); return (await api("/items/page?" + p.toString())).rows; };
-  $("#inv-qr").onclick = async () => {
-    const rows = lastRows.slice(0, 60);
-    if (!rows.length) return;
-    if (lastTotal > 60) toast(`พิมพ์ QR ${rows.length} รายการแรก — กรองให้แคบลงเพื่อพิมพ์รายการอื่น`, "");
-    printLabels(rows.map(it => ({ id: it.id, code: it.item_code, name: (it.part_name || "").slice(0, 30) })));
+  $("#inv-qr").onclick = () => {
+    if (S.labelSel.size) return labelPrintModal([...S.labelSel.values()]);
+    toast("ติ๊กเลือกอะไหล่ที่ต้องการพิมพ์ป้ายก่อน (ช่องสี่เหลี่ยมหน้ารายการ)", "");
+    const b = $("#inv-selbar"); if (b) { b.classList.remove("flash"); void b.offsetWidth; b.classList.add("flash"); }
   };
   if ($("#inv-new")) $("#inv-new").onclick = () => itemEditModal(null, () => run(false));
   $("#inv-xlsx").onclick = () => { const p = params(); downloadAuthed(`/api/export/stock.xlsx?${p.toString()}`, "stock_database.xlsx"); };
@@ -434,23 +466,88 @@ VIEWS.inventory = async () => {
   $("#inv-low").onchange = () => run(true); $("#inv-cat").onchange = () => run(true); $("#inv-mac").onchange = () => run(true);
   run(fresh);
 };
-async function printLabels(items) {
-  toast("กำลังเตรียม QR...", "");
-  const svgs = await Promise.all(items.map(async it => {
-    try { const r = await fetch(`/api/labels/${it.id}.svg`, { headers: { Authorization: "Bearer " + S.token } }); return { ...it, svg: await r.text() }; }
-    catch { return { ...it, svg: "" }; }
-  }));
-  const w = printSink();
-  w.document.write(`<html><head><title>QR Labels</title><style>
-    body{font-family:sans-serif;margin:0;padding:8px;display:flex;flex-wrap:wrap;gap:6px}
-    .lbl{border:1px solid #999;width:150px;padding:6px;text-align:center;page-break-inside:avoid}
-    .lbl svg{width:110px;height:110px}
-    .lbl .c{font-family:monospace;font-weight:bold;font-size:12px;margin-top:2px}
-    .lbl .n{font-size:10px;color:#444;height:24px;overflow:hidden}
-    @media print{.lbl{border:1px solid #000}}
-    </style></head><body>${svgs.map(s => `<div class="lbl">${s.svg}<div class="c">${esc(s.code)}</div><div class="n">${esc(s.name || "")}</div></div>`).join("")}</body></html>`);
-  w.document.close(); setTimeout(() => w.print(), 300);
+const LABEL_SIZES = {   // width x height in mm, per label type
+  qr: { s: [32, 38], m: [40, 48], l: [55, 64] },
+  barcode: { s: [52, 22], m: [64, 28], l: [90, 38] },
+  both: { s: [72, 28], m: [88, 36], l: [104, 50] },   // wide enough that bars stay >= 0.25 mm
+};
+function labelPrintModal(items) {
+  if (!items || !items.length) return toast("ยังไม่ได้เลือกรายการ", "crit");
+  const pref = (() => { try { return JSON.parse(localStorage.getItem("labelPref") || "{}"); } catch { return {}; } })();
+  const opt = (name, v, label, cur) => `<label class="seg"><input type="radio" name="${name}" value="${v}" ${cur === v ? "checked" : ""}><span>${label}</span></label>`;
+  modal(`พิมพ์ป้าย · ${num(items.length)} รายการ`, `
+    <div class="field"><label>ชนิดป้าย</label><div class="segs">
+      ${opt("lb-kind", "qr", "QR Code", pref.kind || "qr")}${opt("lb-kind", "barcode", "บาร์โค้ด (Code 128)", pref.kind)}${opt("lb-kind", "both", "QR + บาร์โค้ด", pref.kind)}</div></div>
+    <div class="field" style="margin-top:12px"><label>ขนาดป้าย</label><div class="segs">
+      ${opt("lb-size", "s", "เล็ก", pref.size)}${opt("lb-size", "m", "กลาง", pref.size || "m")}${opt("lb-size", "l", "ใหญ่", pref.size)}</div>
+      <div class="muted" id="lb-dim" style="font-size:12px;margin-top:4px"></div></div>
+    <div class="row" style="margin-top:12px">
+      <div class="field"><label>จำนวนป้ายต่อรายการ</label><input type="number" id="lb-copies" min="1" max="50" value="${pref.copies || 1}"></div>
+      <div class="field"><label>แสดงบนป้าย</label>
+        <label style="display:flex;gap:6px;align-items:center;font-size:14px"><input type="checkbox" id="lb-name" ${pref.name !== false ? "checked" : ""}> ชื่ออะไหล่</label>
+        <label style="display:flex;gap:6px;align-items:center;font-size:14px"><input type="checkbox" id="lb-loc" ${pref.loc ? "checked" : ""}> ที่เก็บ (กล่อง/ชั้น)</label></div>
+    </div>
+    <div class="lb-preview-wrap"><div class="muted" style="font-size:12px;margin-bottom:6px">ตัวอย่างป้าย (${esc(items[0].code)})</div><div id="lb-preview"></div></div>
+    <details style="margin-top:10px"><summary class="muted" style="cursor:pointer">รายการที่จะพิมพ์ (${num(items.length)})</summary>
+      <div style="max-height:150px;overflow:auto;font-size:13px;margin-top:6px">${items.map(i => `<div><span class="code">${esc(i.code)}</span> ${esc(i.name || "")}</div>`).join("")}</div></details>`,
+    `<button class="btn" data-close>ยกเลิก</button><button class="btn primary" id="lb-go">🖶 พิมพ์ <span id="lb-total"></span></button>`);
+  const val = () => ({
+    kind: $("input[name=lb-kind]:checked").value, size: $("input[name=lb-size]:checked").value,
+    copies: Math.max(1, Math.min(50, Math.floor(+$("#lb-copies").value || 1))), name: $("#lb-name").checked, loc: $("#lb-loc").checked,
+  });
+  let sample = null;
+  const refresh = async () => {
+    const v = val(), [w, h] = LABEL_SIZES[v.kind][v.size];
+    $("#lb-dim").textContent = `${w} × ${h} มม. ต่อป้าย`;
+    $("#lb-total").textContent = `(${num(items.length * v.copies)} ป้าย)`;
+    if (!sample || !sample[v.kind === "both" ? "barcode" : v.kind] || (v.kind === "both" && !sample.qr)) {
+      try { sample = (await api("/labels/batch", { json: { ids: [items[0].id], kind: "both" } }))[0]; } catch { return; }
+    }
+    if ($("#lb-preview")) $("#lb-preview").innerHTML = `<style>${labelCSS(v)}</style>${labelHTML(sample, v)}`;
+  };
+  $$("#modal-root input").forEach(i => i.addEventListener("change", refresh));
+  $("#lb-copies").addEventListener("input", refresh);
+  refresh();
+  $("#lb-go").onclick = async () => {
+    const v = val(); localStorage.setItem("labelPref", JSON.stringify(v));
+    const btn = $("#lb-go"); btn.disabled = true; btn.textContent = "กำลังเตรียมป้าย…";
+    try {
+      let data = [];
+      for (let i = 0; i < items.length; i += 300) {
+        data = data.concat(await api("/labels/batch", { json: { ids: items.slice(i, i + 300).map(x => x.id), kind: v.kind } }));
+      }
+      const bad = data.filter(d => d.barcode_error);
+      if (bad.length) toast(`${bad.length} รายการพิมพ์บาร์โค้ดไม่ได้ (มีอักขระพิเศษ) — ใช้ QR แทน: ${bad.slice(0, 3).map(d => d.code).join(", ")}`, "crit");
+      const html = data.flatMap(d => Array(v.copies).fill(labelHTML(d, v))).join("");
+      closeModal();
+      printHTML(`<html><head><title>ป้ายอะไหล่</title><style>${labelCSS(v)}
+        body{margin:0;padding:4mm}.sheet{display:flex;flex-wrap:wrap;gap:2mm}
+        .printed{display:none}@page{size:A4;margin:6mm}</style></head><body><div class="sheet">${html}</div></body></html>`);
+    } catch (e) { toast(e.message, "crit"); btn.disabled = false; btn.textContent = "🖶 พิมพ์"; }
+  };
 }
+function labelCSS(v) {
+  const [w, h] = LABEL_SIZES[v.kind][v.size], f = { s: 0.85, m: 1, l: 1.25 }[v.size];
+  return `.lbl{box-sizing:border-box;width:${w}mm;height:${h}mm;border:0.3mm dashed #888;padding:1.5mm;display:flex;
+      flex-direction:${v.kind === "both" ? "row" : "column"};align-items:center;justify-content:center;gap:1.5mm;overflow:hidden;
+      page-break-inside:avoid;break-inside:avoid;background:#fff;color:#000;font-family:"IBM Plex Sans Thai",sans-serif}
+    .lbl .qr svg{display:block;width:100%;height:100%}
+    .lbl .qr{flex:0 0 auto;${v.kind === "both" ? `width:${h - 4}mm;height:${h - 4}mm` : `width:${h - (v.kind === "qr" ? 15 : 4) * f}mm;height:${h - 15 * f}mm`}}
+    .lbl .bc{width:100%;height:${v.kind === "both" ? 45 : 55}%}.lbl .bc svg{display:block;width:100%;height:100%}
+    .lbl .txt{min-width:0;flex:1 1 auto;text-align:center;width:100%;display:flex;flex-direction:column;gap:0.6mm;justify-content:center}
+    .lbl .c{font-family:"IBM Plex Mono",monospace;font-weight:700;font-size:${(2.9 * f).toFixed(2)}mm;letter-spacing:0.2mm;white-space:nowrap}
+    .lbl .n{font-size:${(2.2 * f).toFixed(2)}mm;line-height:1.15;max-height:${(4.6 * f).toFixed(2)}mm;overflow:hidden}
+    .lbl .l{font-size:${(2.1 * f).toFixed(2)}mm;color:#333}
+    @media print{.lbl{border:0.2mm solid #bbb}}`;
+}
+function labelHTML(d, v) {
+  const txt = `<div class="c">${esc(d.code)}</div>${v.name && d.name ? `<div class="n">${esc(d.name)}</div>` : ""}${v.loc && (d.box || d.level) ? `<div class="l">📍 ${esc(d.box)} ${esc(d.level)}</div>` : ""}`;
+  if (v.kind === "qr") return `<div class="lbl"><div class="qr">${d.qr || ""}</div><div class="txt">${txt}</div></div>`;
+  if (v.kind === "barcode") return `<div class="lbl"><div class="bc">${d.barcode || '<div style="color:#c00;font-size:3mm">ไม่รองรับ</div>'}</div><div class="txt">${txt}</div></div>`;
+  return `<div class="lbl"><div class="qr">${d.qr || ""}</div><div class="txt"><div class="bc">${d.barcode || ""}</div>${txt}</div></div>`;
+}
+// kept for older callers
+async function printLabels(items) { labelPrintModal(items); }
 const statusTag = (u) => u ? `<span class="tag ${u}">${{ critical: "ต้องสั่งด่วน", high: "ใกล้หมด", watch: "เฝ้าระวัง" }[u]}</span>` : `<span class="tag ok">ปกติ</span>`;
 function itemEditModal(it, onSaved, preset = {}) {
   const isNew = !it;
@@ -1554,37 +1651,123 @@ function stepOneConfirm(title, messageHTML, next) {
 /* ================= IMPORT DATA (admin) ================= */
 VIEWS.importdata = async () => {
   $("#content").innerHTML = `
-    <div class="panel" style="padding:22px;max-width:680px">
-      <p class="section-note">นำเข้าอะไหล่และรายชื่อเครื่องด้วยไฟล์ Template (Excel) — เหมาะกับการเริ่มใช้งานครั้งแรกด้วยข้อมูลของคุณเอง</p>
-      <ol style="line-height:2;padding-left:18px">
+    <div class="panel" style="padding:22px;max-width:900px">
+      <p class="section-note">นำเข้าอะไหล่และรายชื่อเครื่องด้วยไฟล์ Template (Excel) — ระบบจะ <b>ตรวจสอบข้อมูลซ้ำก่อนนำเข้าทุกครั้ง</b> และนำเข้าเฉพาะสิ่งที่คุณเลือก</p>
+      <ol style="line-height:2;padding-left:18px;margin:0">
         <li><b>ดาวน์โหลด Template</b> แล้วกรอกข้อมูลในชีต <span class="code">Items</span> และ <span class="code">Machines</span>
-          <div style="margin:8px 0"><button class="btn" id="dl-tpl">⤓ ดาวน์โหลด Template (.xlsx)</button></div></li>
-        <li><b>อัปโหลดไฟล์ที่กรอกแล้ว</b> — ระบบจะเพิ่ม/อัปเดตตาม <span class="code">item_code</span> (ไม่ลบของเดิม)
-          <div style="margin:8px 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-            <input type="file" id="imp-file" accept=".xlsx">
-            <button class="btn primary" id="imp-go">นำเข้าข้อมูล</button></div>
-          <label style="display:flex;gap:8px;align-items:center;margin-top:8px;font-size:13px;color:var(--crit)"><input type="checkbox" id="imp-clear" style="width:16px;height:16px"> ล้างข้อมูลเดิมทั้งหมดก่อนนำเข้า (เริ่มต้นใหม่ด้วยชุดข้อมูลนี้)</label></li>
+          <div style="margin:6px 0"><button class="btn" id="dl-tpl">⤓ ดาวน์โหลด Template (.xlsx)</button></div></li>
+        <li><b>เลือกไฟล์แล้วกด ตรวจสอบไฟล์</b> — ยังไม่มีการบันทึกข้อมูลใด ๆ ในขั้นนี้
+          <div style="margin:6px 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <input type="file" id="imp-file" accept=".xlsx"><button class="btn primary" id="imp-check">🔍 ตรวจสอบไฟล์</button></div></li>
+        <li><b>ดูผลตรวจ แล้วเลือกวิธีนำเข้า</b></li>
       </ol>
-      <div id="imp-result" class="muted" style="margin-top:8px"></div>
+      <div id="imp-report"></div>
+      <div id="imp-result" style="margin-top:10px"></div>
       <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)">
         คอลัมน์ในชีต Items: <span class="code">item_code, category, description, part_name, part_number, brand, machine_group, uom, box, level, unit_price, on_hand, min_level, reorder_point, lead_time_months</span></div>
     </div>`;
   $("#dl-tpl").onclick = () => downloadAuthed("/api/import/template.xlsx", "import_template.xlsx");
-  $("#imp-go").onclick = async () => {
-    const f = $("#imp-file").files[0];
-    if (!f) return toast("เลือกไฟล์ก่อน", "crit");
-    const clear = $("#imp-clear").checked;
-    if (clear && !confirm("ยืนยันล้างข้อมูลเดิมทั้งหมด (อะไหล่/เครื่อง/การเบิก/PO) แล้วนำเข้าใหม่?")) return;
-    const fd = new FormData(); fd.append("file", f);
-    $("#imp-result").textContent = "กำลังนำเข้า...";
-    try {
-      const r = await fetch(`/api/import/upload?replace=${clear}`, { method: "POST", headers: { Authorization: "Bearer " + S.token }, body: fd });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || "นำเข้าไม่สำเร็จ");
-      $("#imp-result").innerHTML = `<span class="var-ok">✓ นำเข้าสำเร็จ: อะไหล่ ${num(d.items)} รายการ, เครื่อง ${num(d.machines)} รายการ</span>`;
-      toast("นำเข้าข้อมูลสำเร็จ", "ok"); refreshReorderBadge();
-    } catch (e) { $("#imp-result").innerHTML = `<span class="var-bad">✗ ${esc(e.message)}</span>`; }
+  let rep = null, file = null;
+  $("#imp-file").onchange = () => { rep = null; $("#imp-report").innerHTML = ""; $("#imp-result").innerHTML = ""; };
+  const send = async (url, extra = {}) => {
+    const fd = new FormData(); fd.append("file", file);
+    Object.entries(extra).forEach(([k, v]) => fd.append(k, v));
+    const r = await fetch(url, { method: "POST", headers: { Authorization: "Bearer " + S.token }, body: fd });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || "ผิดพลาด");
+    return d;
   };
+  $("#imp-check").onclick = async () => {
+    file = $("#imp-file").files[0];
+    if (!file) return toast("เลือกไฟล์ก่อน", "crit");
+    $("#imp-report").innerHTML = '<div class="muted" style="margin-top:12px">กำลังตรวจสอบ…</div>'; $("#imp-result").innerHTML = "";
+    try { rep = await send("/api/import/preview"); renderReport(); }
+    catch (e) { $("#imp-report").innerHTML = `<div class="var-bad" style="margin-top:12px">✗ ${esc(e.message)}</div>`; }
+  };
+  const tbl = (head, rows) => `<div class="table-wrap" style="max-height:260px;overflow:auto"><table><thead><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("") || `<tr><td colspan="${head.length}" class="muted">-</td></tr>`}</tbody></table></div>`;
+  const fv = v => typeof v === "number" ? num(v) : esc(v === "" || v == null ? "(ว่าง)" : v);
+  const card = (n, label, cls, key) => `<button class="imp-card ${cls}" data-sec="${key}" ${n ? "" : "disabled"}><b>${num(n)}</b><span>${label}</span></button>`;
+  function renderReport() {
+    const r = rep;
+    $("#imp-report").innerHTML = `
+      <h3 style="margin:18px 0 8px">ผลตรวจสอบไฟล์ · ${num(r.rows)} แถว → ${num(r.codes)} รหัสอะไหล่</h3>
+      <div class="imp-cards">
+        ${card(r.new_count, "อะไหล่ใหม่ (ยังไม่มีในระบบ)", "ok", "new")}
+        ${card(r.same_count, "มีในระบบแล้ว · ข้อมูลเหมือนเดิม", "", "same")}
+        ${card(r.changed_count, "มีในระบบแล้ว · ข้อมูลต่างจากเดิม", "warn", "changed")}
+        ${card(r.dup_in_file_count, `รหัสซ้ำกันในไฟล์ (${num(r.dup_rows_extra)} แถวเกิน)`, "warn", "dup")}
+        ${card(r.possible_dup_count, "อาจซ้ำกับอะไหล่เดิม (รหัสต่างกัน)", "warn", "possible")}
+        ${card(r.invalid_count, "แถวที่ข้อมูลผิด (จะไม่นำเข้า)", "bad", "invalid")}
+      </div>
+      <div class="muted" style="font-size:13px;margin:6px 0">เครื่องจักร: ใหม่ ${num(r.machines_new)} · มีแล้ว ${num(r.machines_existing)} · ซ้ำในไฟล์ ${num(r.machines_dup_in_file)} (ระบบไม่สร้างชื่อเครื่องซ้ำ)${r.truncated ? " · แสดงรายการสูงสุด 500 รายการต่อหัวข้อ" : ""}</div>
+      <div id="imp-sec"></div>
+      <div class="panel imp-opts">
+        <h3 style="margin:0 0 8px">เลือกวิธีนำเข้า</h3>
+        <label class="opt"><input type="radio" name="imp-mode" value="new_only" checked><div><b>เพิ่มเฉพาะอะไหล่ใหม่</b> (แนะนำ) — ข้ามรหัสที่มีในระบบแล้วทั้งหมด ไม่แตะต้องข้อมูลเดิม<br><span class="muted">จะเพิ่ม ${num(r.new_count)} รายการ · ข้าม ${num(r.same_count + r.changed_count)} รายการ</span></div></label>
+        <label class="opt"><input type="radio" name="imp-mode" value="update"><div><b>เพิ่มอะไหล่ใหม่ + อัปเดตรายละเอียดที่เปลี่ยน</b> — ชื่อ เบอร์ ที่เก็บ ราคา ROP ฯลฯ<br><span class="muted">ยอดคงเหลือเดิม <b>ไม่ถูกเปลี่ยน</b> (ยอดจากการเบิก/รับจริงยังอยู่ครบ)</span>
+          <label style="display:flex;gap:6px;align-items:center;margin-top:4px"><input type="checkbox" id="imp-stock"> ตั้งยอดคงเหลือตามไฟล์ด้วย (${num(r.stock_changed_count)} รายการ) — ใช้เฉพาะเมื่อเพิ่งตรวจนับของจริง</label></div></label>
+        <label class="opt danger"><input type="radio" name="imp-mode" value="replace"><div><b>ล้างข้อมูลเดิมทั้งหมด แล้วใช้ไฟล์นี้แทน</b> — ลบอะไหล่ เครื่อง การเบิก PO การคืนทั้งหมด (บัญชีผู้ใช้ยังอยู่)</div></label>
+        ${r.dup_in_file_count ? `<div class="field" style="margin-top:10px"><label>รหัสซ้ำกันในไฟล์ (${num(r.dup_in_file_count)} รหัส)</label>
+          <select id="imp-dup"><option value="first">ใช้แถวแรก ข้ามแถวที่ซ้ำ (ป้องกันข้อมูลซ้ำ)</option><option value="sum">รวมเป็นรายการเดียว และรวมยอดคงเหลือ (อะไหล่เก็บหลายที่)</option></select></div>` : ""}
+        ${r.possible_dup_count ? `<label style="display:flex;gap:6px;align-items:center;margin-top:10px"><input type="checkbox" id="imp-skip-possible"> ไม่นำเข้า ${num(r.possible_dup_count)} รายการที่อาจซ้ำกับอะไหล่เดิม</label>` : ""}
+        <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+          <button class="btn primary" id="imp-go">นำเข้าข้อมูล</button>
+          <button class="btn" id="imp-csv">⤓ ดาวน์โหลดผลตรวจสอบ (CSV)</button></div>
+      </div>`;
+    $$("#imp-report [data-sec]").forEach(b => b.onclick = () => { $$("#imp-report [data-sec]").forEach(x => x.classList.toggle("active", x === b)); showSec(b.dataset.sec); });
+    const first = ["dup", "changed", "possible", "invalid", "new"].find(k => (r[{ dup: "dup_in_file_count", changed: "changed_count", possible: "possible_dup_count", invalid: "invalid_count", new: "new_count" }[k]]));
+    if (first) $(`#imp-report [data-sec="${first}"]`).click();
+    $("#imp-go").onclick = doImport; $("#imp-csv").onclick = downloadCsv;
+  }
+  function showSec(k) {
+    const r = rep, box = $("#imp-sec");
+    const H = {
+      new: () => tbl(["แถว", "รหัส", "ชื่อ", "คงเหลือ"], r.new.map(x => `<tr><td>${x.row}</td><td class="code">${esc(x.item_code)}</td><td>${esc(x.name)}</td><td class="num">${num(x.on_hand)}</td></tr>`)),
+      same: () => tbl(["แถว", "รหัส", "ชื่อ"], r.same.map(x => `<tr><td>${x.row}</td><td class="code">${esc(x.item_code)}</td><td>${esc(x.name)}</td></tr>`)),
+      changed: () => tbl(["แถว", "รหัส", "สิ่งที่เปลี่ยน (เดิม → ไฟล์)"], r.changed.map(x => `<tr><td>${x.row}</td><td class="code">${esc(x.item_code)}${x.code_case_differs ? '<div class="muted" style="font-size:11px">ในไฟล์พิมพ์ตัวพิมพ์ต่างกัน</div>' : ""}</td>
+        <td style="font-size:13px">${x.changes.map(c => `<div><b>${c.label}:</b> ${fv(c.old)} → <span class="var-ok">${fv(c.new)}</span></div>`).join("")}${x.stock ? `<div><b>คงเหลือ:</b> ระบบ ${num(x.stock.old)} · ไฟล์ ${num(x.stock.new)} <span class="muted">(เปลี่ยนเฉพาะเมื่อติ๊ก "ตั้งยอดคงเหลือ")</span></div>` : ""}</td></tr>`)),
+      dup: () => tbl(["รหัส", "แถวในไฟล์", "ลักษณะ", "คงเหลือแต่ละแถว"], r.dup_in_file.map(x => `<tr><td class="code">${esc(x.item_code)}</td><td>${x.rows.join(", ")}</td><td>${x.identical ? '<span class="tag watch">ซ้ำทุกช่อง</span>' : '<span class="tag high">รหัสเดียวกัน ข้อมูลต่างกัน</span>'}</td><td>${x.on_hand.map(num).join(" + ")}</td></tr>`)),
+      possible: () => tbl(["แถว", "รหัสในไฟล์", "เหตุผล", "อะไหล่ที่คล้ายกัน"], r.possible_dup.map(x => `<tr><td>${x.row}</td><td class="code">${esc(x.item_code)}</td><td>${esc(x.reason)}</td><td class="code">${x.similar.map(esc).join(", ")}</td></tr>`)),
+      invalid: () => tbl(["แถว", "รหัส", "ปัญหา"], r.invalid.map(x => `<tr><td>${x.row}</td><td class="code">${esc(x.item_code || "-")}</td><td class="var-bad">${x.errors.map(esc).join("<br>")}</td></tr>`)),
+    };
+    box.innerHTML = H[k]();
+  }
+  function downloadCsv() {
+    const r = rep, L = [["หัวข้อ", "แถว", "รหัส", "รายละเอียด"]];
+    r.new.forEach(x => L.push(["ใหม่", x.row, x.item_code, x.name]));
+    r.changed.forEach(x => L.push(["มีแล้ว-ข้อมูลต่าง", x.row, x.item_code, x.changes.map(c => `${c.label}: ${c.old} -> ${c.new}`).concat(x.stock ? [`คงเหลือ: ${x.stock.old} -> ${x.stock.new}`] : []).join(" | ")]));
+    r.same.forEach(x => L.push(["มีแล้ว-เหมือนเดิม", x.row, x.item_code, x.name]));
+    r.dup_in_file.forEach(x => L.push(["ซ้ำในไฟล์", x.rows.join(" "), x.item_code, x.identical ? "ซ้ำทุกช่อง" : "ข้อมูลต่างกัน"]));
+    r.possible_dup.forEach(x => L.push(["อาจซ้ำ", x.row, x.item_code, `${x.reason} (${x.similar.join(" ")})`]));
+    r.invalid.forEach(x => L.push(["ข้อมูลผิด", x.row, x.item_code, x.errors.join(" | ")]));
+    const csv = "﻿" + L.map(row => row.map(c => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+    const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); a.download = "import_check.csv"; a.click();
+  }
+  async function doImport() {
+    const mode = $("input[name=imp-mode]:checked").value;
+    const extra = { mode, dup_rows: $("#imp-dup") ? $("#imp-dup").value : "first", update_stock: mode === "update" && $("#imp-stock").checked ? "true" : "false",
+      skip_codes: $("#imp-skip-possible") && $("#imp-skip-possible").checked ? rep.possible_dup.map(x => x.item_code).join(",") : "" };
+    const finish = async (phrase) => {
+      if (phrase) extra.confirm_text = phrase;
+      $("#imp-result").innerHTML = '<span class="muted">กำลังนำเข้า…</span>';
+      const d = await send("/api/import/upload", extra);
+      closeModal();
+      $("#imp-result").innerHTML = `<div class="panel" style="padding:12px 14px;border-color:var(--ok)"><b class="var-ok">✓ นำเข้าสำเร็จ</b> —
+        เพิ่มใหม่ ${num(d.added)} · อัปเดตรายละเอียด ${num(d.updated)}${d.stock_set ? ` · ตั้งยอดคงเหลือ ${num(d.stock_set)}` : ""} ·
+        ข้ามรายการที่มีแล้ว ${num(d.skipped_existing + d.unchanged)} · ข้ามแถวซ้ำ ${num(d.skipped_dup_rows)}${d.summed_codes ? ` · รวมยอด ${num(d.summed_codes)} รหัส` : ""}${d.skipped_by_user ? ` · ไม่นำเข้า (อาจซ้ำ) ${num(d.skipped_by_user)}` : ""} ·
+        แถวผิดที่ข้าม ${num(d.invalid_skipped)} · เครื่องใหม่ ${num(d.machines_added)}</div>`;
+      toast("นำเข้าข้อมูลสำเร็จ", "ok"); refreshReorderBadge(); S.machines = await api("/machines").catch(() => S.machines);
+      rep = null; $("#imp-report").innerHTML = ""; $("#imp-file").value = "";
+    };
+    try {
+      if (mode === "replace") {
+        return confirmTyped("ล้างข้อมูลเดิมแล้วนำเข้าไฟล์นี้", "<p>อะไหล่ เครื่อง การเบิก การคืน และ PO เดิมทั้งหมดจะถูกลบ แล้วใช้ข้อมูลในไฟล์แทน — ย้อนกลับไม่ได้ (แนะนำดาวน์โหลดสำรองข้อมูลที่เมนูดูแลระบบก่อน)</p>", finish, "ล้างและนำเข้า");
+      }
+      const what = mode === "new_only" ? `เพิ่มอะไหล่ใหม่ ${num(rep.new_count)} รายการ` : `เพิ่มใหม่ ${num(rep.new_count)} + อัปเดต ${num(rep.changed_count)} รายการ${extra.update_stock === "true" ? " (รวมตั้งยอดคงเหลือ)" : ""}`;
+      if (!confirm(`ยืนยันนำเข้า: ${what}?`)) return;
+      await finish();
+    } catch (e) { $("#imp-result").innerHTML = `<span class="var-bad">✗ ${esc(e.message)}</span>`; toast(e.message, "crit"); }
+  }
 };
 
 /* ---------------- start ---------------- */
